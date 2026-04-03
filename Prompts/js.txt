@@ -1,0 +1,329 @@
+You are generating EXACTLY ONE canonical vulnerability record from audited repository history.
+
+Your job is to recover repository-grounded facts from the audited commit and surrounding code, not to generate a chat conversation.
+
+You must:
+1. inspect the pre-fix and post-fix repository state,
+2. identify the primary vulnerable symbol,
+3. resolve all identifiers necessary to explain exploitability and the fix,
+4. recover inter-procedural context and control/data-flow,
+5. reconstruct the full real fix scope,
+6. extract the complete pre-fix and post-fix primary callable body,
+7. untangle vulnerability-relevant hunks from supporting or unrelated hunks,
+8. output exactly one valid JSON object following the schema below.
+
+Treat the CVE and commit as grounding metadata, not as proof of the exact bug mechanism.
+Do not invent identifiers, helper symbols, locations, definitions, vulnerable regions, or patch hunks.
+
+====================
+INPUT ROW
+====================
+- cve_id: {CVE_ID}
+- commit_hash: {COMMIT_HASH}
+- selection_source: {SELECTION_SOURCE}
+- repo_name: {REPO_NAME}
+- repo_url: {REPO_URL}
+- commit_urls: {COMMIT_URLS}
+- source_file: {SOURCE_FILE}
+
+====================
+LANGUAGE ASSUMPTION
+====================
+The target language is JavaScript or TypeScript-like repository code.
+
+The primary vulnerable unit may be any of:
+- function declaration
+- function expression
+- arrow function
+- class method
+- static method
+- object method
+- exported anonymous function
+- callback
+- middleware
+- route handler
+- validator
+- parser hook
+- async helper
+- event handler
+- stream/pipeline transform
+
+Use repository-grounded JavaScript semantics. Do not force C/C++ assumptions onto the code.
+
+====================
+REPOSITORY ANALYSIS REQUIREMENTS
+====================
+- Resolve all identifiers required for exploitability or patch understanding:
+  - imported symbols and re-exported symbols
+  - functions, methods, callbacks, middleware, route handlers
+  - classes, prototypes, constructors
+  - constants, configuration objects, option objects
+  - object literals and property accessors
+  - async helpers, promise chains, event handlers, stream/pipeline helpers
+  - enum-like objects, maps, lookup tables
+  - framework bindings, decorators, parser hooks, validators, sanitizers
+  - module-level helpers and closure-captured variables
+- Recover the caller/callee chain relevant to exploitability
+- Recover attacker-controlled input path where relevant
+- Recover entry points where relevant
+- Recover source-to-sink path where relevant
+- Recover async sequencing where relevant
+- Recover patch scope across all changed files/hunks
+- If a symbol is still unresolved after exhaustive repository search, keep it in `unresolved_identifiers`
+- Prefer exact repository-grounded definitions over paraphrases
+- Prefer exact patch fidelity over explanatory creativity
+- Do not over-resolve unrelated symbols; only include identifiers material to exploitability, control flow, data flow, or the fix
+
+====================
+IDENTIFIER DEFINITION RULES
+====================
+- Every identifier with kind = "function", "method", "callback", "middleware", or "route_handler" MUST include the COMPLETE callable body as the `definition` value, not just a name or summary.
+- The `definition` field for functions/methods/callbacks MUST be valid JavaScript/TypeScript source code, not plain English.
+- The `definition` field for imports, exports, constants, classes, object literals, enum-like constructs, and configuration objects MUST be the actual code definition, not an English description.
+- `primary_symbol_pre` is a top-level attribute containing the full verbatim body of the primary vulnerable callable unit as it existed BEFORE the fix, including the vulnerable line(s).
+- `primary_symbol_post` is a top-level attribute containing the full verbatim body of the primary vulnerable callable unit as it existed AFTER the fix, showing the patched line(s).
+- Both `primary_symbol_pre` and `primary_symbol_post` must be complete, syntactically valid JavaScript/TypeScript callable bodies extracted from the repository at `pre_state` and `post_state` respectively.
+- If the vulnerable logic is implemented as an inline callback, arrow function, class method, or assigned function expression, extract that exact code form verbatim.
+
+====================
+PATCH UNTANGLING RULES
+====================
+- Do not assume every changed hunk in the fix commit is vulnerability-relevant.
+- Separate the patch into:
+  1. `security_fix_hunks`
+  2. `supporting_hunks`
+  3. `unrelated_hunks`
+- A hunk is `security_fix_hunk` only if it directly changes the vulnerable condition, exploitability path, unsafe parser logic, unsafe deserialization logic, input validation, bounds check, state reset, permission check, path normalization, sanitizer, authorization logic, escaping/encoding logic, prototype access, regex validation, or other root-cause-bearing logic.
+- A hunk is `supporting_hunk` if it is required for the security fix to preserve behavior, update dependent code, adjust imports/exports, update framework wiring, keep the program correct, or make the patch coherent, but is not itself the primary vulnerable region.
+- A hunk is `unrelated_hunk` if it is test-only, formatting-only, lint-only, comment-only, logging-only, refactor-only, rename-only, dead-code-only, or otherwise not required to explain or fix the vulnerability.
+- `vulnerable_lines` must refer only to the true pre-fix vulnerable region in the primary vulnerable file, not every touched line in the commit.
+- Preserve the full patch diff in `patch.diff`, but separately identify which hunks are vulnerability-relevant.
+- If a changed file contains both relevant and irrelevant hunks, do not mark the entire file as vulnerable; isolate the specific hunk or region.
+- If uncertainty remains about whether a hunk is supporting vs unrelated, prefer `supporting_hunk` and explain why.
+
+====================
+STRICT OUTPUT RULES
+====================
+- Output VALID JSON only
+- No markdown fences
+- No prose outside JSON
+- No extra top-level keys
+- `unresolved_identifiers` must be an array, possibly empty
+- `patch.diff` must be the complete unified diff for the true fix scope
+- Use normalized severity:
+  LOW | MEDIUM | HIGH | CRITICAL | NONE | UNKNOWN
+- Use `vulnerable_lines` as an array of integers when the primary vulnerable file/callable is clear
+- If the true fix spans multiple files, include all of them in `patch.files`
+- `primary_symbol_pre` must be a non-empty string containing the complete pre-fix callable body
+- `primary_symbol_post` must be a non-empty string containing the complete post-fix callable body
+- All `resolved_identifiers[].definition` fields must contain actual code definitions, not English descriptions
+- `primary_vulnerable_region` must refer to the root-cause-bearing pre-fix code region only
+- `patch_relevance` must be present even if one or more of its arrays are empty
+- `module_bindings_resolved` must count imports, exports, re-exports, and framework/module linkages actually resolved
+- `shape_constraints_resolved` must count runtime or schema-like constraints resolved from code, validation libraries, guards, or inferred object structure
+- Do not fabricate line numbers, imports, exports, function names, or diff hunks
+
+====================
+OUTPUT SCHEMA
+====================
+{
+  "id": "<cve>__<file_path_sanitized>__<primary_symbol>",
+  "cve_id": "<string>",
+  "repo": "<string>",
+  "repo_url": "<string>",
+  "selection_source": "<string>",
+  "language": "JavaScript",
+  "file_path": "<primary vulnerable file path>",
+  "primary_symbol": "<primary vulnerable callable name>",
+  "primary_symbol_kind": "<function|method|callback|middleware|route_handler|class_method|object_method|arrow_function|anonymous_export|event_handler|validator|parser_hook|async_helper>",
+  "helper_symbols": ["<callable_or_symbol>", "..."],
+  "module_system": "<commonjs|esm|hybrid|unknown>",
+  "runtime_context": {
+    "platform": "<node|browser|deno|bun|unknown>",
+    "framework": "<express|koa|fastify|next|react|vue|hapi|plain|unknown>",
+    "execution_model": "<sync|async|mixed>"
+  },
+  "commit": "<fix commit sha>",
+  "pre_state": "<parent commit sha>",
+  "post_state": "<fix commit sha>",
+  "cwe": "<CWE-ID or UNKNOWN>",
+  "severity": "<LOW|MEDIUM|HIGH|CRITICAL|NONE|UNKNOWN>",
+  "vulnerable": <true|false>,
+  "vulnerable_lines": [<int>, "..."],
+  "primary_symbol_pre": "<full callable body from pre-fix version>",
+  "primary_symbol_post": "<full callable body from post-fix version>",
+  "primary_vulnerable_region": {
+    "file": "<path>",
+    "lines": [<int>, "..."],
+    "reason": "<precise explanation of why this is the root-cause-bearing pre-fix region>"
+  },
+  "root_cause": "<precise repository-grounded explanation>",
+  "impact": "<short impact summary>",
+  "exploitability_summary": "<short exploitability summary>",
+  "attack_preconditions": ["<string>", "..."],
+  "entry_points": [
+    {
+      "symbol": "<string>",
+      "file": "<string>",
+      "kind": "<http_handler|middleware|parser|cli_entry|stream_handler|event_listener|api_surface|other>",
+      "reason": "<why this is attacker-reachable or externally reachable>"
+    }
+  ],
+  "input_sources": [
+    {
+      "expression": "<code expression or source>",
+      "file": "<path>",
+      "kind": "<req.body|req.query|req.params|header|cookie|json|stream|event|dom|url|file|other>",
+      "taint_role": "<attacker_controlled|derived|validated>"
+    }
+  ],
+  "security_sinks": [
+    {
+      "expression": "<sink expression>",
+      "file": "<path>",
+      "kind": "<eval|Function|exec|fs_write|path_join|template_render|sql_query|http_redirect|html_render|deserializer|crypto_use|other>",
+      "reason": "<why this sink matters>"
+    }
+  ],
+  "sanitizers_or_guards": [
+    {
+      "symbol": "<string>",
+      "file": "<path>",
+      "kind": "<validator|sanitizer|guard|escape|normalizer|schema_check>",
+      "status": "<present|missing|insufficient|bypassed>",
+      "reason": "<why>"
+    }
+  ],
+  "call_chain": [
+    {
+      "function": "<string>",
+      "file": "<string>",
+      "role": "<entry|caller|callee|sink|helper>"
+    }
+  ],
+  "control_flow_summary": "<string>",
+  "data_flow_summary": "<string>",
+  "async_flow_summary": "<string>",
+  "patch_intent": {
+    "category": "<input_validation|bounds_check|state_reset|null_guard|path_normalization|encoding_fix|auth_fix|permission_fix|resource_limit|other>",
+    "primary_effect": "<short sentence>",
+    "behavior_change": "<what changes semantically>"
+  },
+  "negative_evidence": ["<rejected hypothesis>", "..."],
+  "resolved_identifiers": [
+    {
+      "name": "<identifier>",
+      "kind": "<function|method|callback|middleware|route_handler|class|constant|object|field|import|export|enum_like|other>",
+      "definition": "<actual code definition or full callable body>",
+      "location": "<file:line or file range>",
+      "relevance": "<why this identifier matters>"
+    }
+  ],
+  "unresolved_identifiers": ["<identifier>", "..."],
+  "patch": {
+    "files": ["<path>", "..."],
+    "diff": "<full unified diff>",
+    "scope_summary": "<short summary of patch scope>"
+  },
+  "patch_relevance": {
+    "security_fix_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk directly fixes the vulnerability>"
+      }
+    ],
+    "supporting_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk supports but does not directly implement the fix>"
+      }
+    ],
+    "unrelated_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk is not vulnerability-relevant>"
+      }
+    ]
+  },
+  "validation": {
+    "grounded_in_commit": <true|false>,
+    "patch_matches_post_state": <true|false>,
+    "analysis_matches_pre_state": <true|false>
+  },
+  "context_quality": {
+    "callees_resolved": <int>,
+    "types_resolved": <int>,
+    "module_bindings_resolved": <int>,
+    "shape_constraints_resolved": <int>,
+    "callers_found": <int>,
+    "unresolved": <int>,
+    "coverage_score": <float_0_to_1>,
+    "method": "opencode_glm5_hybrid_semantic"
+  },
+  "validator_quality": "high",
+  "schema_version": "canonical_v2_js"
+}
+
+====================
+NORMALIZATION RULES
+====================
+- `primary_symbol` should be the main vulnerable callable unit whose behavior best represents the vulnerability
+- `helper_symbols` should include only directly relevant helper callables or symbols
+- `cwe` must be a single normalized string, not an array
+- `severity` must be a single normalized string
+- `vulnerable_lines` must be line numbers from the pre-fix state for the primary vulnerable file
+- `resolved_identifiers` should be concise but sufficient to reconstruct reasoning
+- `unresolved_identifiers` must list any symbols still not grounded after exhaustive search
+- If a detail is uncertain, prefer explicit uncertainty in the relevant text field rather than hallucination
+- `primary_vulnerable_region.lines` should normally be a subset of or equal to `vulnerable_lines`
+- `security_fix_hunks` should capture direct vulnerability-bearing changes only, not the full patch by default
+- If the primary vulnerable callable is anonymous or inline, use a stable synthetic name in `primary_symbol`, grounded by location or binding context
+
+====================
+INTERNAL WORKFLOW YOU MUST FOLLOW
+====================
+Before producing the JSON:
+1. Determine the parent of `{COMMIT_HASH}` and set it as `pre_state`
+2. Inspect the fix commit and determine the true patch scope
+3. Identify the primary vulnerable callable unit in `{SOURCE_FILE}` or the touched file set
+4. Extract the complete pre-fix callable body for the primary vulnerable target from `pre_state`
+5. Extract the complete post-fix callable body for the primary vulnerable target from `post_state`
+6. Inspect the surrounding implementation and directly relevant helpers
+7. Resolve relevant imports, exports, constants, classes, methods, callbacks, middleware, object fields, route bindings, validator helpers, and helper bodies from the repository
+8. Recover the exploitability-relevant call chain
+9. Recover the externally reachable entry points
+10. Recover attacker-controlled sources and security-relevant sinks
+11. Identify relevant sanitizers, validators, guards, or missing guards
+12. Identify the root-cause-bearing pre-fix region
+13. Partition all changed hunks into `security_fix_hunks`, `supporting_hunks`, and `unrelated_hunks`
+14. Verify that the vulnerability explanation matches the pre-fix code
+15. Verify that the patch matches the post-fix code
+16. Count unresolved identifiers and set both `unresolved_identifiers` and `context_quality.unresolved`
+17. Verify the final JSON is parseable
+
+====================
+FINAL SELF-CHECK
+====================
+Do not output until all are true:
+1. `pre_state` is the real parent of `{COMMIT_HASH}`
+2. `primary_symbol` is the true primary vulnerable callable unit
+3. `patch.diff` matches the audited fix scope
+4. `context_quality.unresolved` equals the number of items in `unresolved_identifiers`
+5. `primary_symbol_pre` is present, non-empty, and contains a complete callable body with opening and closing braces, or an exact valid arrow/function expression form
+6. `primary_symbol_post` is present, non-empty, and contains a complete callable body with opening and closing braces, or an exact valid arrow/function expression form
+7. Every `resolved_identifier` with kind = "function", "method", "callback", "middleware", or "route_handler" has a `definition` field containing a complete callable body, not just a name or signature
+8. No `definition` field in `resolved_identifiers` contains plain English instead of code
+9. All code definitions are syntactically plausible JavaScript/TypeScript source code
+10. `primary_vulnerable_region` is present and refers only to the true root-cause-bearing pre-fix region
+11. `patch_relevance.security_fix_hunks`, `patch_relevance.supporting_hunks`, and `patch_relevance.unrelated_hunks` are all present
+12. No changed hunk that is clearly unrelated is mislabeled as a security fix hunk
+13. `entry_points`, `input_sources`, `security_sinks`, and `sanitizers_or_guards` are present, even if empty
+14. The final JSON is valid and complete
+
+Now produce the final canonical JSON object only.

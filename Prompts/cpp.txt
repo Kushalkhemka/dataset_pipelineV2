@@ -1,0 +1,298 @@
+You are generating EXACTLY ONE canonical vulnerability record from audited repository history for a C++ codebase.
+
+Your job is to recover repository-grounded facts from the audited commit and surrounding code, not to generate a chat conversation.
+
+You must:
+1. inspect the pre-fix and post-fix repository state,
+2. identify the primary vulnerable C++ item,
+3. resolve all identifiers necessary to explain exploitability and the fix,
+4. recover inter-procedural context and data/control-flow,
+5. reconstruct the full real fix scope,
+6. extract the complete pre-fix and post-fix primary item bodies,
+7. untangle vulnerability-relevant hunks from supporting or unrelated hunks,
+8. output exactly one valid JSON object following the schema below.
+
+Treat the CVE and commit as grounding metadata, not as proof of the exact bug mechanism.
+Do not invent identifiers, helper functions, locations, definitions, vulnerable regions, or patch hunks.
+
+====================
+INPUT ROW
+====================
+- cve_id: {CVE_ID}
+- commit_hash: {COMMIT_HASH}
+- selection_source: {SELECTION_SOURCE}
+- repo_name: {REPO_NAME}
+- repo_url: {REPO_URL}
+- commit_urls: {COMMIT_URLS}
+- source_file: {SOURCE_FILE}
+
+====================
+C++ REPOSITORY ANALYSIS REQUIREMENTS
+====================
+- Resolve all identifiers required for exploitability or patch understanding:
+  - free functions
+  - member functions, static member functions, constructors, destructors
+  - overloaded operators
+  - namespaces and namespace-qualified symbols
+  - classes, structs, unions, enums, typedefs, type aliases
+  - templates, template specializations, partial specializations, and instantiated helper types where relevant
+  - macros and macro expansions
+  - constants, statics, constexpr values, inline variables, globals
+  - imported/include-defined identifiers
+  - inheritance relationships, virtual methods, and overridden methods where relevant
+  - references, raw pointers, smart pointers, RAII cleanup objects, allocators, iterators, ranges, and containers where relevant
+  - exception-related items (`throw`, `noexcept`, exception types) where relevant
+- Recover the caller/callee chain relevant to exploitability
+- Recover attacker-controlled input path where relevant
+- Recover patch scope across all changed files/hunks
+- If a symbol is still unresolved after exhaustive repository search, keep it in `unresolved_identifiers`
+- Prefer exact repository-grounded definitions over paraphrases
+- Prefer exact patch fidelity over explanatory creativity
+- Do not over-resolve unrelated symbols; only include identifiers material to exploitability, control flow, data flow, type semantics, ownership, object lifetime, exception behavior, or the fix
+
+====================
+C++ IDENTIFIER DEFINITION RULES
+====================
+- Every identifier with kind = "function", "method", "constructor", "destructor", or "operator" MUST include the COMPLETE body (from full signature through closing brace) as the `definition` value.
+- Every identifier with executable kind MUST include `function_body` and it MUST contain the COMPLETE body as valid source code.
+- Every identifier with kind = "struct", "class", "union", or "enum" MUST include the COMPLETE code definition as the `definition` value.
+- Every identifier with kind = "struct", "class", or "union" MUST include `type_body` and it MUST contain the COMPLETE code body, including opening and closing braces.
+- The `definition` field for executable items and types MUST be valid C++ source code, not plain English.
+- The `definition` field for macros, constants, typedefs, aliases, structs, classes, unions, and enums MUST be the actual code definition, not an English description.
+- `vulnerable_function_pre` is a top-level attribute containing the full verbatim body of the primary vulnerable function or method as it existed BEFORE the fix.
+- `vulnerable_function_post` is a top-level attribute containing the full verbatim body of the primary vulnerable function or method as it existed AFTER the fix.
+- Both `vulnerable_function_pre` and `vulnerable_function_post` must be complete, syntactically valid C++ source code function or method bodies extracted from the repository at `pre_state` and `post_state` respectively.
+- If the primary vulnerable item is a member function, preserve the full method body and identify it using a stable qualified name such as `Namespace::Type::method`.
+
+====================
+PATCH UNTANGLING RULES
+====================
+- Do not assume every changed hunk in the fix commit is vulnerability-relevant.
+- Separate the patch into:
+  1. `security_fix_hunks`
+  2. `supporting_hunks`
+  3. `unrelated_hunks`
+- A hunk is `security_fix_hunk` only if it directly changes the vulnerable condition, exploitability path, memory-safety condition, bounds check, state reset, pointer/reference validity, object lifetime, ownership transfer, RAII cleanup behavior, parser validation, arithmetic guard, authorization condition, exception safety, iterator/range validity, virtual dispatch correctness, or other root-cause-bearing logic.
+- A hunk is `supporting_hunk` if it is required for the security fix to compile, link, preserve invariants, maintain lifetime/ownership correctness, update template or inheritance-related dependent logic, or propagate the fix safely, but is not itself the primary vulnerable region.
+- A hunk is `unrelated_hunk` if it is test-only, formatting-only, comment-only, logging-only, refactor-only, rename-only, dead-code-only, or otherwise not required to explain or fix the vulnerability.
+- `vulnerable_line_ranges` must be compact inclusive ranges for the same pre-fix vulnerable region, formatted as `[[start_line, end_line], ...]`.
+- Preserve the full patch diff in `patch.diff`, but separately identify which hunks are vulnerability-relevant.
+- If a changed file contains both relevant and irrelevant hunks, do not mark the entire file as vulnerable; isolate the specific hunk or region.
+- If uncertainty remains about whether a hunk is supporting vs unrelated, prefer `supporting_hunk` and explain the reason in the hunk annotation.
+
+====================
+C++ VULNERABILITY ANALYSIS FOCUS
+====================
+When applicable, analyze whether the vulnerability involves one or more of:
+- use-after-free, double free, invalid free
+- null dereference
+- out-of-bounds read/write
+- integer overflow, truncation, signedness conversion, size mismatch
+- parser/deserialization flaws
+- iterator invalidation or container misuse
+- dangling references or lifetime misuse
+- ownership bugs involving raw pointers, smart pointers, move/copy semantics, or RAII
+- uninitialized data use
+- exception safety failures
+- virtual dispatch or inheritance-related confusion
+- authorization or validation bypass
+- resource exhaustion, infinite loop, or unbounded allocation
+- concurrency issues involving shared state, atomics, locks, or thread-unsafe objects where relevant
+
+====================
+STRICT OUTPUT RULES
+====================
+- Output VALID JSON only
+- No markdown fences
+- No prose outside JSON
+- No extra top-level keys
+- `unresolved_identifiers` must be an array, possibly empty
+- `patch.diff` must be the complete unified diff for the true fix scope
+- Use normalized severity:
+  LOW | MEDIUM | HIGH | CRITICAL | NONE | UNKNOWN
+- Use `vulnerable_line_ranges` as compact inclusive ranges `[[start_line, end_line], ...]` from the same pre-fix vulnerable region
+- If the true fix spans multiple files, include all of them in `patch.files`
+- `vulnerable_function_pre` must be a non-empty string containing the complete pre-fix function or method body
+- `vulnerable_function_post` must be a non-empty string containing the complete post-fix function or method body
+- All `resolved_identifiers[].definition` fields must contain actual C++ code definitions, not English descriptions
+- For each `resolved_identifiers[]` item with executable kind, `function_body` must be present and non-empty
+- For each `resolved_identifiers[]` item with kind = `struct`, `class`, or `union`, `type_body` must be present and non-empty
+- `primary_vulnerable_region` must refer to the root-cause-bearing pre-fix code region only
+- `patch_relevance` must be present even if one or more of its arrays are empty
+
+====================
+OUTPUT SCHEMA
+====================
+{
+  "id": "<cve>__<file_path_sanitized>__<primary_item>",
+  "cve_id": "<string>",
+  "repo": "<string>",
+  "repo_url": "<string>",
+  "selection_source": "<string>",
+  "language": "C++",
+  "language_variant": "<c++|objective-c++ if applicable>",
+  "file_path": "<primary vulnerable file path>",
+  "primary_function": "<primary vulnerable item name>",
+  "item_kind": "<function|method|constructor|destructor|operator|other>",
+  "namespace_context": "<namespace or UNKNOWN>",
+  "class_context": {
+    "class_name": "<name or null>",
+    "base_classes": ["<base>", "..."]
+  },
+  "template_context": {
+    "is_template": <true|false>,
+    "template_parameters": ["<param>", "..."]
+  },
+  "helper_functions": ["<item>", "..."],
+  "commit": "<fix commit sha>",
+  "pre_state": "<parent commit sha>",
+  "post_state": "<fix commit sha>",
+  "cwe": "<CWE-ID or UNKNOWN>",
+  "severity": "<LOW|MEDIUM|HIGH|CRITICAL|NONE|UNKNOWN>",
+  "vulnerable": <true|false>,
+  "vulnerable_line_ranges": [[<int>, <int>], "..."],
+  "vulnerable_function_pre": "<full function or method body from pre-state>",
+  "vulnerable_function_post": "<full function or method body from post-state>",
+  "primary_vulnerable_region": {
+    "file": "<path>",
+    "lines": [<int>, "..."],
+    "reason": "<precise explanation of why this is the root-cause-bearing pre-fix region>"
+  },
+  "root_cause": "<precise repository-grounded explanation>",
+  "impact": "<short impact summary>",
+  "exploitability_summary": "<short exploitability summary>",
+  "attack_preconditions": ["<string>", "..."],
+  "call_chain": [
+    {
+      "function": "<string>",
+      "file": "<string>",
+      "role": "<entry|caller|callee|sink|helper>"
+    }
+  ],
+  "ownership_notes": "<pointer/reference ownership and lifetime notes>",
+  "exception_behavior": {
+    "can_throw": <true|false>,
+    "throw_sites": [<int>, "..."]
+  },
+  "control_flow_summary": "<string>",
+  "data_flow_summary": "<string>",
+  "resolved_identifiers": [
+    {
+      "name": "<identifier>",
+      "kind": "<macro|struct|class|union|typedef|enum|function|method|constructor|destructor|operator|constant|field|namespace|template|generated_helper|other>",
+      "definition": "<actual code definition or full executable body>",
+      "function_body": "<full body when executable kind; otherwise empty string>",
+      "type_body": "<full struct/class/union body when applicable; otherwise empty string>",
+      "location": "<file:line or file range>",
+      "relevance": "<why this identifier matters>"
+    }
+  ],
+  "unresolved_identifiers": ["<identifier>", "..."],
+  "patch": {
+    "files": ["<path>", "..."],
+    "diff": "<full unified diff>",
+    "scope_summary": "<short summary of patch scope>"
+  },
+  "patch_relevance": {
+    "security_fix_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk directly fixes the vulnerability>"
+      }
+    ],
+    "supporting_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk supports but does not directly implement the fix>"
+      }
+    ],
+    "unrelated_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk is not vulnerability-relevant>"
+      }
+    ]
+  },
+  "validation": {
+    "grounded_in_commit": <true|false>,
+    "patch_matches_post_state": <true|false>,
+    "analysis_matches_pre_state": <true|false>
+  },
+  "context_quality": {
+    "callees_resolved": <int>,
+    "types_resolved": <int>,
+    "macros_resolved": <int>,
+    "callers_found": <int>,
+    "unresolved": <int>,
+    "coverage_score": <float_0_to_1>,
+    "method": "opencode_glm5_hybrid_semantic"
+  },
+  "validator_quality": "high",
+  "schema_version": "canonical_cpp_v1"
+}
+
+====================
+NORMALIZATION RULES
+====================
+- `primary_function` should be the main C++ item whose behavior best represents the vulnerability
+- Use stable qualified naming, e.g. `Namespace::Type::method`
+- `helper_functions` should include only directly relevant items
+- `cwe` must be a single normalized string, not an array
+- `severity` must be a single normalized string
+- `vulnerable_line_ranges` must be inclusive pre-fix ranges in the form `[[start_line, end_line], ...]`
+- `resolved_identifiers` should be concise but sufficient to reconstruct reasoning
+- `unresolved_identifiers` must list any symbols still not grounded after exhaustive search
+- If a detail is uncertain, prefer explicit uncertainty in the relevant text field rather than hallucination
+- `primary_vulnerable_region.lines` should normally align with `vulnerable_line_ranges`
+- `security_fix_hunks` should capture direct vulnerability-bearing changes only, not the full patch by default
+
+====================
+INTERNAL WORKFLOW YOU MUST FOLLOW
+====================
+Before producing the JSON:
+1. Determine the parent of `{COMMIT_HASH}` and set it as `pre_state`
+2. Inspect the fix commit and determine the true patch scope
+3. Identify the primary vulnerable C++ item in `{SOURCE_FILE}` or the touched file set
+4. Determine namespace/class/template context for the primary item if possible
+5. Determine whether the primary item is a free function, method, constructor, destructor, operator, or template instantiation-sensitive item
+6. Extract the complete pre-fix body for the primary vulnerable item from `pre_state`
+7. Extract the complete post-fix body for the primary vulnerable item from `post_state`
+8. Inspect the surrounding implementation and directly relevant helpers, classes, templates, namespaces, macros, type definitions, and ownership/lifetime helpers
+9. Resolve relevant macros, typedefs, structs, classes, fields, enums, constants, helper bodies, and imported/include-defined APIs from the repository
+10. Recover the exploitability-relevant call chain
+11. Identify the root-cause-bearing pre-fix region
+12. Determine whether ownership, RAII cleanup, move/copy behavior, exception behavior, or virtual dispatch materially affect exploitability
+13. Partition all changed hunks into `security_fix_hunks`, `supporting_hunks`, and `unrelated_hunks`
+14. Verify that the vulnerability explanation matches the pre-fix code
+15. Verify that the patch matches the post-fix code
+16. Count unresolved identifiers and set both `unresolved_identifiers` and `context_quality.unresolved`
+17. Verify the final JSON is parseable
+
+====================
+FINAL SELF-CHECK
+====================
+Do not output until all are true:
+1. `pre_state` is the real parent of `{COMMIT_HASH}`
+2. `primary_function` is the true primary vulnerable C++ item
+3. `patch.diff` matches the audited fix scope
+4. `context_quality.unresolved` equals the number of items in `unresolved_identifiers`
+5. `vulnerable_function_pre` is present, non-empty, and contains a complete C++ function or method body with opening and closing braces
+6. `vulnerable_function_post` is present, non-empty, and contains a complete C++ function or method body with opening and closing braces
+7. `vulnerable_line_ranges` is present and uses inclusive `[[start,end], ...]` pairs
+8. Every `resolved_identifier` with executable kind has a `definition` field containing a complete body, not just a signature
+9. Every `resolved_identifier` with executable kind has `function_body` present and non-empty, containing a complete body
+10. Every `resolved_identifier` with kind = `struct`, `class`, or `union` has `type_body` present and non-empty, containing a complete type body
+11. No `definition` field in `resolved_identifiers` contains plain English instead of code
+12. All code definitions are syntactically plausible C++ source code
+13. `primary_vulnerable_region` is present and refers only to the true root-cause-bearing pre-fix region
+14. `patch_relevance.security_fix_hunks`, `patch_relevance.supporting_hunks`, and `patch_relevance.unrelated_hunks` are all present
+15. No changed hunk that is clearly unrelated is mislabeled as a security fix hunk
+16. The final JSON is valid and complete
+
+Now produce the final canonical JSON object only. Save it as a valid json file.

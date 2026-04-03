@@ -1,0 +1,142 @@
+You are generating EXACTLY ONE canonical vulnerability record from audited repository history.
+Your job is to recover repository-grounded facts from the audited commit and surrounding code, not to generate a chat conversation.
+You must:
+1. inspect the pre-fix and post-fix repository state,
+2. identify the primary vulnerable function,
+3. resolve all identifiers necessary to explain exploitability and the fix,
+4. recover inter-procedural context and data/control-flow,
+5. reconstruct the full real fix scope,
+6. output exactly one valid JSON object following the schema below.
+Treat the CVE and commit as grounding metadata, not as proof of the exact bug mechanism.
+Do not invent identifiers, helper functions, locations, execution stories, or patch hunks.
+====================
+INPUT ROW
+====================
+- cve_id: {CVE_ID}
+- commit_hash: {COMMIT_HASH}
+- selection_source: {SELECTION_SOURCE}
+- repo_name: {REPO_NAME}
+- repo_url: {REPO_URL}
+- commit_urls: {COMMIT_URLS}
+- source_file: {SOURCE_FILE}
+====================
+ANALYSIS RULES
+====================
+- Resolve only identifiers that are material to exploitability, control flow, data flow, or the patch.
+- Include directly relevant macros, typedefs, structs, unions, enums, helper functions, constants/statics, imported/header-defined identifiers, and generated helper macros if they affect reasoning.
+- Recover caller/callee chain relevant to exploitability.
+- Recover attacker-controlled input path where relevant.
+- Recover the true patch scope across all changed files/hunks.
+- If a symbol remains unresolved after exhaustive repository search, include it in `unresolved_identifiers`.
+- Root-cause wording must be conservative and directly supported by the pre-fix code and fix diff.
+- Do not over-specify the bug mechanism beyond what the repository evidence supports.
+- If uncertainty remains, use explicit uncertainty in text fields rather than hallucination.
+====================
+STRICT OUTPUT RULES
+====================
+- Output VALID JSON only.
+- No markdown fences.
+- No prose outside JSON.
+- No extra top-level keys.
+- Every field must match the required type exactly.
+- `unresolved_identifiers` must be an array, possibly empty.
+- `patch.diff` must contain the full unified diff for the true fix scope.
+- `patch.files` must be an array of file paths.
+- `vulnerable_line_ranges` must be an array of inclusive ranges from the same pre-fix vulnerable region, formatted as `[[start_line, end_line], ...]`.
+- For each `resolved_identifiers[]` item with `kind = "function"`, `function_body` must be present and non-empty.
+- Use normalized enums only:
+  - `severity`: LOW | MEDIUM | HIGH | CRITICAL | NONE | UNKNOWN
+  - `language`: normalized language name, e.g. C, C++, Python, Rust, Go, Java
+- `cwe` must be a single normalized string, not an array.
+====================
+CONSISTENCY RULES
+====================
+- `primary_function` must be the main function whose behavior best represents the vulnerability.
+- `helper_functions` must include only directly relevant helpers.
+- Every item in `helper_functions` should either appear in `resolved_identifiers` or be intentionally omitted from `resolved_identifiers` only if trivial and non-material.
+- `context_quality.unresolved` must equal the length of `unresolved_identifiers`.
+- `context_quality.macros_resolved` must equal the number of items in `resolved_identifiers` with kind = "macro".
+- `context_quality.types_resolved` must equal the number of items in `resolved_identifiers` with kind in {"struct","union","typedef","enum"}.
+- `context_quality.callees_resolved` must equal the number of direct relevant callees resolved in `resolved_identifiers`.
+- The summaries (`root_cause`, `impact`, `exploitability_summary`, `control_flow_summary`, `data_flow_summary`) must not contradict `patch.diff` or `resolved_identifiers`.
+====================
+OUTPUT SCHEMA
+====================
+{
+  "id": "<cve>__<file_path_sanitized>__<primary_function>",
+  "cve_id": "<string>",
+  "repo": "<string>",
+  "repo_url": "<string>",
+  "selection_source": "<string>",
+  "language": "<string>",
+  "file_path": "<primary vulnerable file path>",
+  "primary_function": "<primary vulnerable function name>",
+  "helper_functions": ["<function>", "..."],
+  "commit": "<fix commit sha>",
+  "pre_state": "<parent commit sha>",
+  "post_state": "<fix commit sha>",
+  "cwe": "<CWE-ID or UNKNOWN>",
+  "severity": "<LOW|MEDIUM|HIGH|CRITICAL|NONE|UNKNOWN>",
+  "vulnerable": <true|false>,
+  "vulnerable_line_ranges": [[<int>, <int>], "..."],
+  "root_cause": "<precise repository-grounded explanation>",
+  "impact": "<short impact summary>",
+  "exploitability_summary": "<short exploitability summary>",
+  "attack_preconditions": ["<string>", "..."],
+  "call_chain": [
+    {
+      "function": "<string>",
+      "file": "<string>",
+      "role": "<entry|caller|callee|sink|helper>"
+    }
+  ],
+  "control_flow_summary": "<string>",
+  "data_flow_summary": "<string>",
+  "resolved_identifiers": [
+    {
+      "name": "<identifier>",
+      "kind": "<macro|struct|union|typedef|enum|function|constant|field|generated_helper|other>",
+      "definition": "<short resolved definition>",
+      "function_body": "<full function body when kind=function; otherwise empty string>",
+      "location": "<file:line or file range>",
+      "relevance": "<why this identifier matters>"
+    }
+  ],
+  "unresolved_identifiers": ["<identifier>", "..."],
+  "patch": {
+    "files": ["<path>", "..."],
+    "diff": "<full unified diff>",
+    "scope_summary": "<short summary of patch scope>"
+  },
+  "validation": {
+    "grounded_in_commit": <true|false>,
+    "patch_matches_post_state": <true|false>,
+    "analysis_matches_pre_state": <true|false>
+  },
+  "context_quality": {
+    "callees_resolved": <int>,
+    "types_resolved": <int>,
+    "macros_resolved": <int>,
+    "callers_found": <int>,
+    "unresolved": <int>,
+    "coverage_score": <float_0_to_1>,
+    "method": "opencode_glm5_hybrid_semantic"
+  },
+  "validator_quality": "high",
+  "schema_version": "canonical_v2"
+}
+====================
+FINAL SELF-CHECK
+====================
+Before output:
+1. verify JSON parses,
+2. verify all required arrays are arrays,
+3. verify `patch.files` is an array,
+4. verify `vulnerable_line_ranges` are inclusive `[[start,end], ...]` pairs,
+5. verify `context_quality` counts match the actual contents,
+6. verify no summary contradicts the patch or root cause,
+7. verify no invented helper/function/type definitions were introduced,
+8. verify every `resolved_identifiers` item with `kind=function` has non-empty `function_body`.
+Now output the final canonical JSON object only. Save the output json into a file, make sure the resolution of indentifiers definitions must be valid code not the plain english text
+
+TEST THIS PROMPT on server

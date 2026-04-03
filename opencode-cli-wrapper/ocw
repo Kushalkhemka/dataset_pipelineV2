@@ -1,0 +1,1039 @@
+#!/usr/bin/env python3
+"""Thin headless CLI wrapper for opencode.
+
+This wrapper intentionally does not add policy/restrictions. It forwards flags
+directly to native `opencode run` / `opencode serve` and adds optional batch
+execution for prompt datasets.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from shutil import which
+from threading import Event, Lock
+from typing import Any, Iterable, Sequence
+
+
+DEFAULT_BINARY = "opencode"
+FULL_PERMISSION_CONFIG = {
+    "permission": {
+        "edit": "allow",
+        "bash": "allow",
+        "webfetch": "allow",
+        "doom_loop": "allow",
+        "external_directory": "allow",
+    },
+    "experimental": {
+        "batch_tool": True,
+    },
+}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def eprint(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def split_passthrough(args: Sequence[str]) -> tuple[list[str], list[str]]:
+    items = list(args)
+    if "--" not in items:
+        return items, []
+    index = items.index("--")
+    return items[:index], items[index + 1 :]
+
+
+def has_option(passthrough: Sequence[str], option: str) -> bool:
+    return any(item == option or item.startswith(f"{option}=") for item in passthrough)
+
+
+def resolve_binary(candidate: str) -> str:
+    path = which(candidate)
+    if path:
+        return path
+    raise SystemExit(f"error: unable to find '{candidate}' in PATH")
+
+
+def run_command(command: Sequence[str], cwd: str | None = None, env: dict[str, str] | None = None) -> int:
+    try:
+        completed = subprocess.run(command, cwd=cwd, check=False, env=env)
+        return completed.returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def build_env(all_permissions: bool, xdg_data_home: str | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    if all_permissions:
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(FULL_PERMISSION_CONFIG, ensure_ascii=True)
+    if xdg_data_home:
+        env["XDG_DATA_HOME"] = xdg_data_home
+    return env
+
+
+def _safe_worker_key(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+    cleaned = cleaned.strip("._-")
+    return cleaned or "worker"
+
+
+def resolve_xdg_data_home(
+    command_name: str,
+    explicit_xdg_data_home: str | None,
+    isolate_db: bool,
+    isolation_root: str,
+    worker_id: str | None,
+) -> str | None:
+    if explicit_xdg_data_home and isolate_db:
+        raise SystemExit("error: use either --xdg-data-home or --isolate-db, not both")
+
+    if explicit_xdg_data_home:
+        path = Path(explicit_xdg_data_home).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    if not isolate_db:
+        return None
+
+    worker_key = _safe_worker_key(worker_id or f"{command_name}-{os.getpid()}")
+    root = Path(isolation_root).expanduser()
+    path = root / worker_key
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def normalize_id(raw_value: str | None, prefix: str, mapping: dict[str, str], enable: bool) -> str | None:
+    if raw_value is None:
+        return None
+    if not enable:
+        return raw_value
+    cached = mapping.get(raw_value)
+    if cached is not None:
+        return cached
+    normalized = f"{prefix}{len(mapping) + 1}"
+    mapping[raw_value] = normalized
+    return normalized
+
+
+def truncate_text(value: str, max_chars: int) -> str:
+    if max_chars < 0:
+        return value
+    if len(value) <= max_chars:
+        return value
+    return f"{value[:max_chars]}...<TRUNCATED:{len(value)}>"
+
+
+def sanitize_value(value: Any, max_chars: int) -> Any:
+    if isinstance(value, str):
+        return truncate_text(value, max_chars=max_chars)
+    if isinstance(value, list):
+        return [sanitize_value(item, max_chars=max_chars) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: sanitize_value(value[key], max_chars=max_chars)
+            for key in sorted(value.keys(), key=str)
+        }
+    return value
+
+
+def parse_prompt(prompt: str | None, use_stdin: bool, prompt_words: Sequence[str]) -> str:
+    sources = int(prompt is not None) + int(use_stdin) + int(bool(prompt_words))
+    if sources == 0:
+        raise SystemExit("error: provide a prompt via --prompt, --stdin, or positional text")
+    if sources > 1:
+        raise SystemExit("error: use exactly one prompt source (--prompt, --stdin, or positional)")
+
+    if prompt is not None:
+        return prompt
+    if use_stdin:
+        text = sys.stdin.read().strip()
+        if not text:
+            raise SystemExit("error: stdin prompt is empty")
+        return text
+    return " ".join(prompt_words).strip()
+
+
+def parse_text_prompts(path: Path) -> list[str]:
+    prompts: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        value = line.strip()
+        if value:
+            prompts.append(value)
+    return prompts
+
+
+def parse_jsonl_prompts(path: Path) -> list[str]:
+    prompts: list[str] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"error: invalid JSONL at line {line_number}: {exc}") from exc
+
+        if isinstance(item, str):
+            prompt = item
+        elif isinstance(item, dict):
+            prompt = item.get("prompt") or item.get("message") or item.get("input")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise SystemExit(
+                    f"error: JSONL line {line_number} object must include non-empty "
+                    f"'prompt' or 'message' string"
+                )
+        else:
+            raise SystemExit(
+                f"error: JSONL line {line_number} must be a string or object, got {type(item)}"
+            )
+
+        prompts.append(prompt.strip())
+
+    return prompts
+
+
+def parse_json_prompts(path: Path) -> list[str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"error: invalid JSON file '{path}': {exc}") from exc
+
+    if not isinstance(payload, list):
+        raise SystemExit("error: JSON prompt file must be an array")
+
+    prompts: list[str] = []
+    for index, item in enumerate(payload):
+        if isinstance(item, str) and item.strip():
+            prompts.append(item.strip())
+            continue
+        if isinstance(item, dict):
+            prompt = item.get("prompt") or item.get("message") or item.get("input")
+            if isinstance(prompt, str) and prompt.strip():
+                prompts.append(prompt.strip())
+                continue
+        raise SystemExit(
+            "error: JSON array items must be non-empty strings or objects with "
+            f"'prompt'/'message' (index {index})"
+        )
+
+    return prompts
+
+
+def parse_csv_prompts(path: Path, csv_column: str | None = None, csv_template: str | None = None) -> list[str]:
+    prompts: list[str] = []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        if not fieldnames:
+            raise SystemExit("error: CSV input must include a header row")
+
+        default_column = csv_column
+        if default_column is None and not csv_template:
+            for candidate in ("prompt", "message", "input"):
+                if candidate in fieldnames:
+                    default_column = candidate
+                    break
+            if default_column is None and len(fieldnames) == 1:
+                default_column = fieldnames[0]
+            if default_column is None:
+                raise SystemExit(
+                    "error: CSV input needs --csv-column or --csv-template "
+                    f"(available columns: {', '.join(fieldnames)})"
+                )
+
+        if default_column and default_column not in fieldnames:
+            raise SystemExit(
+                f"error: CSV column '{default_column}' not found "
+                f"(available: {', '.join(fieldnames)})"
+            )
+
+        for row_number, row in enumerate(reader, start=2):
+            row_data = {key: (value or "").strip() for key, value in row.items()}
+            if csv_template:
+                try:
+                    prompt = csv_template.format(**row_data).strip()
+                except KeyError as exc:
+                    missing = str(exc).strip("'")
+                    raise SystemExit(
+                        f"error: CSV template references missing column '{missing}' "
+                        f"at line {row_number}"
+                    ) from exc
+            else:
+                prompt = row_data.get(default_column or "", "").strip()
+            if prompt:
+                prompts.append(prompt)
+
+    return prompts
+
+
+def load_prompts(
+    input_path: str,
+    csv_column: str | None = None,
+    csv_template: str | None = None,
+    offset: int = 0,
+    limit: int | None = None,
+) -> list[str]:
+    if input_path == "-":
+        prompts = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]
+        if not prompts:
+            raise SystemExit("error: no prompts found on stdin")
+        if offset:
+            prompts = prompts[offset:]
+        if limit is not None:
+            prompts = prompts[:limit]
+        return prompts
+
+    path = Path(input_path)
+    if not path.exists():
+        raise SystemExit(f"error: prompt file not found: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        prompts = parse_jsonl_prompts(path)
+    elif suffix == ".json":
+        prompts = parse_json_prompts(path)
+    elif suffix == ".csv":
+        prompts = parse_csv_prompts(path, csv_column=csv_column, csv_template=csv_template)
+    else:
+        prompts = parse_text_prompts(path)
+
+    if offset:
+        prompts = prompts[offset:]
+    if limit is not None:
+        prompts = prompts[:limit]
+
+    if not prompts:
+        raise SystemExit("error: prompt file did not contain any usable prompts")
+    return prompts
+
+
+def build_worker_xdg_homes(
+    workers: int,
+    command_name: str,
+    explicit_xdg_data_home: str | None,
+    isolate_db: bool,
+    isolation_root: str,
+    worker_id: str | None,
+) -> list[str | None]:
+    if workers < 1:
+        raise SystemExit("error: workers must be >= 1")
+
+    if workers == 1:
+        return [
+            resolve_xdg_data_home(
+                command_name=command_name,
+                explicit_xdg_data_home=explicit_xdg_data_home,
+                isolate_db=isolate_db,
+                isolation_root=isolation_root,
+                worker_id=worker_id,
+            )
+        ]
+
+    root_base = Path((explicit_xdg_data_home or isolation_root)).expanduser()
+    root_base.mkdir(parents=True, exist_ok=True)
+    prefix = _safe_worker_key(worker_id or "worker")
+    homes: list[str] = []
+    for slot in range(workers):
+        slot_name = f"{prefix}-{slot + 1:03d}"
+        path = root_base / slot_name
+        path.mkdir(parents=True, exist_ok=True)
+        homes.append(str(path))
+    return homes
+
+
+def run_prompt_once(
+    *,
+    index: int,
+    prompt: str,
+    binary: str,
+    cwd: str | None,
+    base_passthrough: Sequence[str],
+    all_permissions: bool,
+    xdg_data_home: str | None,
+    worker_slot: int,
+) -> dict[str, object]:
+    command = [binary, "run", prompt, *base_passthrough]
+    started_monotonic = time.monotonic()
+    started_at = now_iso()
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        check=False,
+        env=build_env(all_permissions=all_permissions, xdg_data_home=xdg_data_home),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    ended_at = now_iso()
+    duration_seconds = round(time.monotonic() - started_monotonic, 3)
+    return {
+        "index": index,
+        "worker_slot": worker_slot,
+        "xdg_data_home": xdg_data_home,
+        "prompt": prompt,
+        "command": command,
+        "exit_code": completed.returncode,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": duration_seconds,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+def command_run(argv: Sequence[str]) -> int:
+    wrapper_argv, passthrough_delimited = split_passthrough(argv)
+    parser = argparse.ArgumentParser(
+        prog="ocw run",
+        description="Run one headless opencode prompt and forward all unknown flags to `opencode run`.",
+    )
+    parser.add_argument("-p", "--prompt", help="Prompt text")
+    parser.add_argument("--stdin", action="store_true", help="Read prompt text from stdin")
+    parser.add_argument("--binary", default=DEFAULT_BINARY, help="opencode binary path/name")
+    parser.add_argument("--cwd", help="Working directory for opencode")
+    parser.add_argument(
+        "--xdg-data-home",
+        help="Set XDG_DATA_HOME for this run (isolates opencode.db location)",
+    )
+    parser.add_argument(
+        "--isolate-db",
+        action="store_true",
+        help="Create/use isolated XDG_DATA_HOME under --isolation-root",
+    )
+    parser.add_argument(
+        "--isolation-root",
+        default="/tmp/ocw_xdg",
+        help="Root directory for isolated XDG_DATA_HOME paths",
+    )
+    parser.add_argument(
+        "--worker-id",
+        help="Worker/shard id used with --isolate-db (e.g., shard-01)",
+    )
+    parser.add_argument("--json-events", action="store_true", help="Force --format json")
+    parser.add_argument("--print-command", action="store_true", help="Print the command before running")
+    parser.add_argument(
+        "--respect-opencode-permissions",
+        action="store_true",
+        help="Do not inject full-allow permissions (default injects full allow)",
+    )
+    parser.add_argument("prompt_words", nargs="*", help="Prompt words (alternative to --prompt)")
+    args, passthrough_unknown = parser.parse_known_args(wrapper_argv)
+    passthrough = [*passthrough_unknown, *passthrough_delimited]
+
+    prompt = parse_prompt(args.prompt, args.stdin, args.prompt_words)
+    binary = resolve_binary(args.binary)
+    xdg_data_home = resolve_xdg_data_home(
+        command_name="run",
+        explicit_xdg_data_home=args.xdg_data_home,
+        isolate_db=args.isolate_db,
+        isolation_root=args.isolation_root,
+        worker_id=args.worker_id,
+    )
+
+    command = [binary, "run", prompt]
+    if args.json_events and not has_option(passthrough, "--format"):
+        command.extend(["--format", "json"])
+    command.extend(passthrough)
+
+    if args.print_command:
+        eprint(f"$ {shlex.join(command)}")
+    if xdg_data_home:
+        eprint(f"[ocw] using XDG_DATA_HOME={xdg_data_home}")
+
+    return run_command(
+        command,
+        cwd=args.cwd,
+        env=build_env(
+            all_permissions=not args.respect_opencode_permissions,
+            xdg_data_home=xdg_data_home,
+        ),
+    )
+
+
+def command_serve(argv: Sequence[str]) -> int:
+    wrapper_argv, passthrough_delimited = split_passthrough(argv)
+    parser = argparse.ArgumentParser(
+        prog="ocw serve",
+        description="Start a headless opencode server, forwarding all flags to `opencode serve`.",
+    )
+    parser.add_argument("--binary", default=DEFAULT_BINARY, help="opencode binary path/name")
+    parser.add_argument("--cwd", help="Working directory for opencode")
+    parser.add_argument(
+        "--xdg-data-home",
+        help="Set XDG_DATA_HOME for this server (isolates opencode.db location)",
+    )
+    parser.add_argument(
+        "--isolate-db",
+        action="store_true",
+        help="Create/use isolated XDG_DATA_HOME under --isolation-root",
+    )
+    parser.add_argument(
+        "--isolation-root",
+        default="/tmp/ocw_xdg",
+        help="Root directory for isolated XDG_DATA_HOME paths",
+    )
+    parser.add_argument(
+        "--worker-id",
+        help="Worker/shard id used with --isolate-db (e.g., shard-01)",
+    )
+    parser.add_argument("--print-command", action="store_true", help="Print the command before running")
+    parser.add_argument(
+        "--respect-opencode-permissions",
+        action="store_true",
+        help="Do not inject full-allow permissions (default injects full allow)",
+    )
+    args, passthrough_unknown = parser.parse_known_args(wrapper_argv)
+    passthrough = [*passthrough_unknown, *passthrough_delimited]
+
+    binary = resolve_binary(args.binary)
+    xdg_data_home = resolve_xdg_data_home(
+        command_name="serve",
+        explicit_xdg_data_home=args.xdg_data_home,
+        isolate_db=args.isolate_db,
+        isolation_root=args.isolation_root,
+        worker_id=args.worker_id,
+    )
+    command = [binary, "serve", *passthrough]
+
+    if args.print_command:
+        eprint(f"$ {shlex.join(command)}")
+    if xdg_data_home:
+        eprint(f"[ocw] using XDG_DATA_HOME={xdg_data_home}")
+
+    return run_command(
+        command,
+        cwd=args.cwd,
+        env=build_env(
+            all_permissions=not args.respect_opencode_permissions,
+            xdg_data_home=xdg_data_home,
+        ),
+    )
+
+
+def iter_batch_records(
+    prompts: Iterable[str],
+    binary: str,
+    cwd: str | None,
+    passthrough: Sequence[str],
+    all_permissions: bool,
+    fail_fast: bool,
+    sleep_seconds: float,
+    print_command: bool,
+    json_events: bool,
+    xdg_data_home: str | None,
+) -> Iterable[dict[str, object]]:
+    base_passthrough = list(passthrough)
+    if json_events and not has_option(base_passthrough, "--format"):
+        base_passthrough = [*base_passthrough, "--format", "json"]
+
+    for index, prompt in enumerate(prompts):
+        command = [binary, "run", prompt, *base_passthrough]
+        if print_command:
+            eprint(f"$ {shlex.join(command)}")
+        record = run_prompt_once(
+            index=index,
+            prompt=prompt,
+            binary=binary,
+            cwd=cwd,
+            base_passthrough=base_passthrough,
+            all_permissions=all_permissions,
+            xdg_data_home=xdg_data_home,
+            worker_slot=1,
+        )
+        yield record
+
+        if int(record["exit_code"]) != 0 and fail_fast:
+            break
+
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+
+def command_batch(argv: Sequence[str]) -> int:
+    wrapper_argv, passthrough_delimited = split_passthrough(argv)
+    parser = argparse.ArgumentParser(
+        prog="ocw batch",
+        description=(
+            "Run many prompts from a file using `opencode run` and write JSONL results. "
+            "Unknown flags are forwarded to `opencode run`."
+        ),
+    )
+    parser.add_argument("-i", "--input", required=True, help="Prompt file (.txt, .json, .jsonl) or '-' for stdin")
+    parser.add_argument("-o", "--output", default="results.jsonl", help="Results JSONL file path")
+    parser.add_argument("--append", action="store_true", help="Append to output instead of overwriting")
+    parser.add_argument("--binary", default=DEFAULT_BINARY, help="opencode binary path/name")
+    parser.add_argument("--cwd", help="Working directory for opencode")
+    parser.add_argument(
+        "--xdg-data-home",
+        help="Set XDG_DATA_HOME for batch worker (isolates opencode.db location)",
+    )
+    parser.add_argument(
+        "--isolate-db",
+        action="store_true",
+        help="Create/use isolated XDG_DATA_HOME under --isolation-root",
+    )
+    parser.add_argument(
+        "--isolation-root",
+        default="/tmp/ocw_xdg",
+        help="Root directory for isolated XDG_DATA_HOME paths",
+    )
+    parser.add_argument(
+        "--worker-id",
+        help="Worker/shard id used with --isolate-db (e.g., shard-01)",
+    )
+    parser.add_argument("--json-events", action="store_true", help="Force --format json")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers to run (default: 1)",
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Skip the first N prompts from input before processing",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Process at most N prompts after offset",
+    )
+    parser.add_argument(
+        "--csv-column",
+        help="CSV column to read prompt text from (for .csv input)",
+    )
+    parser.add_argument(
+        "--csv-template",
+        help=(
+            "CSV row template, e.g. "
+            "\"CVE: {cve_id}\\nCommit: {commit_hash}\\nFile: {source_file}\""
+        ),
+    )
+    parser.add_argument("--fail-fast", action="store_true", help="Stop after first non-zero exit")
+    parser.add_argument("--sleep-seconds", type=float, default=0.0, help="Sleep duration between prompts")
+    parser.add_argument("--print-command", action="store_true", help="Print each command before running")
+    parser.add_argument(
+        "--respect-opencode-permissions",
+        action="store_true",
+        help="Do not inject full-allow permissions (default injects full allow)",
+    )
+    args, passthrough_unknown = parser.parse_known_args(wrapper_argv)
+    passthrough = [*passthrough_unknown, *passthrough_delimited]
+
+    if args.sleep_seconds < 0:
+        raise SystemExit("error: --sleep-seconds must be >= 0")
+    if args.workers < 1:
+        raise SystemExit("error: --workers must be >= 1")
+    if args.offset < 0:
+        raise SystemExit("error: --offset must be >= 0")
+    if args.limit is not None and args.limit < 1:
+        raise SystemExit("error: --limit must be >= 1")
+    if args.input == "-" and (args.csv_column or args.csv_template):
+        raise SystemExit("error: --csv-column/--csv-template require a .csv file input")
+
+    binary = resolve_binary(args.binary)
+    prompts = load_prompts(
+        args.input,
+        csv_column=args.csv_column,
+        csv_template=args.csv_template,
+        offset=args.offset,
+        limit=args.limit,
+    )
+
+    auto_isolated = False
+    if args.workers > 1 and not args.isolate_db and args.xdg_data_home is None:
+        args.isolate_db = True
+        auto_isolated = True
+
+    worker_xdg_homes = build_worker_xdg_homes(
+        workers=args.workers,
+        command_name="batch",
+        explicit_xdg_data_home=args.xdg_data_home,
+        isolate_db=args.isolate_db,
+        isolation_root=args.isolation_root,
+        worker_id=args.worker_id,
+    )
+
+    if auto_isolated:
+        eprint(
+            f"[batch] workers={args.workers}: auto-enabled isolated DB paths "
+            f"under {args.isolation_root}"
+        )
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    mode = "a" if args.append else "w"
+    stats = {"total": 0, "failures": 0}
+    write_lock = Lock()
+    stop_event = Event()
+    base_passthrough = [*passthrough]
+    if args.json_events and not has_option(base_passthrough, "--format"):
+        base_passthrough = [*base_passthrough, "--format", "json"]
+
+    def write_record(handle: Any, record: dict[str, object]) -> None:
+        with write_lock:
+            stats["total"] += 1
+            if int(record["exit_code"]) != 0:
+                stats["failures"] += 1
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+            handle.flush()
+            eprint(
+                f"[batch] {stats['total']}/{len(prompts)} "
+                f"worker={record['worker_slot']} exit={record['exit_code']} "
+                f"duration={record['duration_seconds']}s"
+            )
+            if int(record["exit_code"]) != 0 and args.fail_fast:
+                stop_event.set()
+
+    with output_path.open(mode, encoding="utf-8") as handle:
+        if args.workers == 1:
+            if worker_xdg_homes[0]:
+                eprint(f"[ocw] using XDG_DATA_HOME={worker_xdg_homes[0]}")
+            for index, prompt in enumerate(prompts):
+                if stop_event.is_set():
+                    break
+                command_preview = [binary, "run", prompt, *base_passthrough]
+                if args.print_command:
+                    eprint(f"$ {shlex.join(command_preview)}")
+                record = run_prompt_once(
+                    index=index,
+                    prompt=prompt,
+                    binary=binary,
+                    cwd=args.cwd,
+                    base_passthrough=base_passthrough,
+                    all_permissions=not args.respect_opencode_permissions,
+                    xdg_data_home=worker_xdg_homes[0],
+                    worker_slot=1,
+                )
+                write_record(handle, record)
+                if stop_event.is_set():
+                    break
+                if args.sleep_seconds > 0:
+                    time.sleep(args.sleep_seconds)
+        else:
+            for slot, home in enumerate(worker_xdg_homes, start=1):
+                if home:
+                    eprint(f"[ocw] worker={slot} XDG_DATA_HOME={home}")
+
+            def worker_loop(worker_slot: int) -> None:
+                home = worker_xdg_homes[worker_slot - 1]
+                for index in range(worker_slot - 1, len(prompts), args.workers):
+                    if stop_event.is_set():
+                        break
+                    prompt = prompts[index]
+                    command_preview = [binary, "run", prompt, *base_passthrough]
+                    if args.print_command:
+                        with write_lock:
+                            eprint(f"$ [worker={worker_slot}] {shlex.join(command_preview)}")
+                    record = run_prompt_once(
+                        index=index,
+                        prompt=prompt,
+                        binary=binary,
+                        cwd=args.cwd,
+                        base_passthrough=base_passthrough,
+                        all_permissions=not args.respect_opencode_permissions,
+                        xdg_data_home=home,
+                        worker_slot=worker_slot,
+                    )
+                    write_record(handle, record)
+                    if stop_event.is_set():
+                        break
+                    if args.sleep_seconds > 0:
+                        time.sleep(args.sleep_seconds)
+
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = [executor.submit(worker_loop, slot) for slot in range(1, args.workers + 1)]
+                for future in futures:
+                    future.result()
+
+    eprint(
+        f"[batch] wrote {stats['total']} record(s) to {output_path} "
+        f"(failures={stats['failures']})"
+    )
+    return 0 if stats["failures"] == 0 else 1
+
+
+def command_trajectory(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="ocw trajectory",
+        description=(
+            "Deterministically convert opencode --format json event streams into "
+            "tool-calling trajectory JSONL records."
+        ),
+    )
+    parser.add_argument("-i", "--input", required=True, help="Raw opencode JSON events file (.jsonl)")
+    parser.add_argument("-o", "--output", default="trajectories.jsonl", help="Output JSONL path")
+    parser.add_argument("--append", action="store_true", help="Append to output instead of overwriting")
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=4,
+        help="Number of prior assistant text chunks to include with each tool action",
+    )
+    parser.add_argument(
+        "--history-window",
+        type=int,
+        default=6,
+        help=(
+            "Number of prior tool turns to include in each record context "
+            "(0 disables prior tool history)"
+        ),
+    )
+    parser.add_argument(
+        "--max-output-chars",
+        type=int,
+        default=12000,
+        help="Deterministically truncate long string fields to this many chars (-1 disables)",
+    )
+    parser.add_argument(
+        "--raw-ids",
+        action="store_true",
+        help="Keep raw session/call/message/part IDs instead of deterministic normalized IDs",
+    )
+    args = parser.parse_args(list(argv))
+
+    if args.context_window < 0:
+        raise SystemExit("error: --context-window must be >= 0")
+    if args.history_window < 0:
+        raise SystemExit("error: --history-window must be >= 0")
+    if args.max_output_chars < -1:
+        raise SystemExit("error: --max-output-chars must be >= -1")
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        raise SystemExit(f"error: input file not found: {input_path}")
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    normalize_ids_enabled = not args.raw_ids
+    session_id_map: dict[str, str] = {}
+    call_id_map: dict[str, str] = {}
+    message_id_map: dict[str, str] = {}
+    part_id_map: dict[str, str] = {}
+
+    assistant_text_by_session: dict[str, list[str]] = {}
+    tool_turn_by_session: dict[str, int] = {}
+    prior_tools_by_session: dict[str, list[dict[str, Any]]] = {}
+
+    total_lines = 0
+    text_events = 0
+    tool_events = 0
+    bad_lines = 0
+
+    mode = "a" if args.append else "w"
+    with input_path.open("r", encoding="utf-8") as reader, output_path.open(
+        mode,
+        encoding="utf-8",
+    ) as writer:
+        for line_number, raw_line in enumerate(reader, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            total_lines += 1
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                bad_lines += 1
+                continue
+
+            if not isinstance(event, dict):
+                continue
+
+            event_type = event.get("type")
+            part = event.get("part")
+            if not isinstance(part, dict):
+                part = {}
+
+            raw_session_id = event.get("sessionID")
+            if not isinstance(raw_session_id, str) or not raw_session_id:
+                raw_session_id = part.get("sessionID")
+            if not isinstance(raw_session_id, str) or not raw_session_id:
+                raw_session_id = "__missing_session__"
+
+            if event_type == "text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    compact_text = text.strip()
+                    if compact_text:
+                        assistant_text_by_session.setdefault(raw_session_id, []).append(
+                            truncate_text(compact_text, max_chars=args.max_output_chars),
+                        )
+                        text_events += 1
+                continue
+
+            if event_type != "tool_use":
+                continue
+
+            tool_name = part.get("tool")
+            if not isinstance(tool_name, str) or not tool_name:
+                continue
+
+            state = part.get("state")
+            if not isinstance(state, dict):
+                state = {}
+
+            tool_events += 1
+            tool_turn_by_session[raw_session_id] = tool_turn_by_session.get(raw_session_id, 0) + 1
+
+            normalized_session_id = normalize_id(
+                raw_session_id,
+                prefix="s",
+                mapping=session_id_map,
+                enable=normalize_ids_enabled,
+            )
+            normalized_call_id = normalize_id(
+                part.get("callID") if isinstance(part.get("callID"), str) else None,
+                prefix="c",
+                mapping=call_id_map,
+                enable=normalize_ids_enabled,
+            )
+            normalized_message_id = normalize_id(
+                part.get("messageID") if isinstance(part.get("messageID"), str) else None,
+                prefix="m",
+                mapping=message_id_map,
+                enable=normalize_ids_enabled,
+            )
+            normalized_part_id = normalize_id(
+                part.get("id") if isinstance(part.get("id"), str) else None,
+                prefix="p",
+                mapping=part_id_map,
+                enable=normalize_ids_enabled,
+            )
+
+            context_chunks = assistant_text_by_session.get(raw_session_id, [])
+            if args.context_window > 0:
+                context_chunks = context_chunks[-args.context_window :]
+            else:
+                context_chunks = []
+
+            prior_tool_turns = prior_tools_by_session.get(raw_session_id, [])
+            if args.history_window > 0:
+                prior_tool_turns = prior_tool_turns[-args.history_window :]
+            else:
+                prior_tool_turns = []
+
+            action_input = sanitize_value(state.get("input"), max_chars=args.max_output_chars)
+            observation_output = sanitize_value(state.get("output"), max_chars=args.max_output_chars)
+            observation_metadata = sanitize_value(
+                state.get("metadata"),
+                max_chars=args.max_output_chars,
+            )
+            observation_status = state.get("status")
+
+            record = {
+                "trajectory_schema": "ocw_tool_call_pair_v1",
+                "source_file": str(input_path),
+                "line_number": line_number,
+                "session_id": normalized_session_id,
+                "turn_index": tool_turn_by_session[raw_session_id],
+                "context": {
+                    "assistant_text_window": context_chunks,
+                    "prior_tool_turns": prior_tool_turns,
+                },
+                "action": {
+                    "tool": tool_name,
+                    "call_id": normalized_call_id,
+                    "input": action_input,
+                },
+                "observation": {
+                    "status": observation_status,
+                    "output": observation_output,
+                    "metadata": observation_metadata,
+                },
+                "refs": {
+                    "message_id": normalized_message_id,
+                    "part_id": normalized_part_id,
+                },
+            }
+            writer.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+
+            current_turn_summary = {
+                "turn_index": tool_turn_by_session[raw_session_id],
+                "tool": tool_name,
+                "call_id": normalized_call_id,
+                "input": action_input,
+                "status": observation_status,
+                "output": observation_output,
+            }
+            prior_tools_by_session.setdefault(raw_session_id, []).append(current_turn_summary)
+
+    eprint(
+        f"[trajectory] wrote {tool_events} tool record(s) to {output_path} "
+        f"(input_lines={total_lines}, text_events={text_events}, "
+        f"sessions={len(set(tool_turn_by_session.keys()))}, bad_lines={bad_lines})",
+    )
+    return 0
+
+
+def print_top_help() -> None:
+    print(
+        """ocw - thin headless wrapper for opencode
+
+Usage:
+  ocw run [wrapper flags] [prompt words] [-- opencode run flags...]
+  ocw batch -i prompts.txt [wrapper flags] [-- opencode run flags...]
+  ocw trajectory -i raw_events.jsonl [wrapper flags]
+  ocw serve [wrapper flags] [-- opencode serve flags...]
+
+Wrapper commands:
+  run    Execute one prompt in headless mode (opencode run)
+  batch  Execute many prompts and write JSONL outputs
+  trajectory  Convert raw json-events stream into deterministic tool-call trajectories
+  serve  Start a headless opencode server (opencode serve)
+
+Examples:
+  ocw run --prompt "list TODOs in this repo" -- --continue --agent default
+  echo "audit this codebase" | ocw run --stdin -- --attach http://127.0.0.1:4096
+  ocw batch -i shard01.jsonl -o out01.jsonl --isolate-db --worker-id shard01
+  ocw trajectory -i output/raw_events.jsonl -o output/trajectories.jsonl
+  ocw serve -- --hostname 0.0.0.0 --port 4096
+  ocw batch -i prompts.jsonl -o results.jsonl --json-events -- --attach http://127.0.0.1:4096
+
+Default behavior:
+  Full permissions are injected for opencode (edit/bash/webfetch/doom_loop/external_directory = allow).
+  Use --respect-opencode-permissions on any command to disable this behavior.
+  For parallel workers, use --isolate-db with --worker-id to isolate opencode.db per worker.
+"""
+    )
+
+
+def main(argv: Sequence[str]) -> int:
+    if len(argv) < 2 or argv[1] in {"-h", "--help", "help"}:
+        print_top_help()
+        return 0
+
+    command = argv[1]
+    rest = argv[2:]
+
+    if command == "run":
+        return command_run(rest)
+    if command == "batch":
+        return command_batch(rest)
+    if command == "trajectory":
+        return command_trajectory(rest)
+    if command == "serve":
+        return command_serve(rest)
+
+    eprint(f"error: unknown command '{command}'")
+    print_top_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

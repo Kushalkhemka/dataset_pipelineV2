@@ -1,0 +1,319 @@
+You are generating EXACTLY ONE canonical vulnerability record from audited repository history for a Swift codebase.
+
+Your job is to recover repository-grounded facts from the audited commit and surrounding code, not to generate a chat conversation.
+
+You must:
+1. inspect the pre-fix and post-fix repository state,
+2. identify the primary vulnerable Swift item,
+3. resolve all identifiers necessary to explain exploitability and the fix,
+4. recover inter-procedural context and data/control-flow,
+5. reconstruct the full real fix scope,
+6. extract the complete pre-fix and post-fix primary item bodies,
+7. untangle vulnerability-relevant hunks from supporting or unrelated hunks,
+8. output exactly one valid JSON object following the schema below.
+
+Treat the CVE and commit as grounding metadata, not as proof of the exact bug mechanism.
+Do not invent identifiers, helper functions, locations, definitions, vulnerable regions, or patch hunks.
+
+====================
+INPUT ROW
+====================
+- cve_id: {CVE_ID}
+- commit_hash: {COMMIT_HASH}
+- selection_source: {SELECTION_SOURCE}
+- repo_name: {REPO_NAME}
+- repo_url: {REPO_URL}
+- commit_urls: {COMMIT_URLS}
+- source_file: {SOURCE_FILE}
+
+====================
+SWIFT-SPECIFIC REPOSITORY ANALYSIS REQUIREMENTS
+====================
+- Resolve all identifiers required for exploitability or patch understanding:
+  - free functions
+  - instance methods
+  - static methods
+  - class methods
+  - initializers and convenience initializers
+  - deinitializers
+  - computed properties and property accessors
+  - subscripts
+  - protocols and protocol requirements
+  - extensions
+  - structs, classes, enums, actors
+  - type aliases
+  - module-level constants and globals
+  - imported or re-exported identifiers from `import`
+  - generic parameters, constraints, and `where` clauses when they affect correctness
+  - associated types and protocol conformances when relevant
+  - property wrappers, result builders, attached/freestanding macros, and synthesized members where relevant
+  - Objective-C bridging, Foundation APIs, C/Objective-C interop, and unsafe pointer APIs where relevant
+- Recover the caller/callee chain relevant to exploitability
+- Recover attacker-controlled input path where relevant
+- Recover patch scope across all changed files/hunks
+- If a symbol is still unresolved after exhaustive repository search, keep it in `unresolved_identifiers`
+- Prefer exact repository-grounded definitions over paraphrases
+- Prefer exact patch fidelity over explanatory creativity
+- Do not over-resolve unrelated symbols; only include identifiers material to exploitability, control flow, data flow, error handling, ARC behavior, concurrency behavior, unsafe usage, or the fix
+
+====================
+SWIFT IDENTIFIER DEFINITION RULES
+====================
+- Every identifier with kind = "function", "method", "initializer", "deinitializer", "property", or "subscript" MUST include the COMPLETE item body (from declaration/signature through closing brace) as the `definition` value.
+- The `definition` field for executable items MUST be valid Swift source code, not plain English.
+- The `definition` field for protocols, extensions, structs, classes, enums, actors, type aliases, globals, constants, property wrappers, and macros MUST be the actual Swift code definition, not an English description.
+- `vulnerable_function_pre` is a top-level attribute containing the full verbatim body of the primary vulnerable Swift item as it existed BEFORE the fix, including the vulnerable line(s).
+- `vulnerable_function_post` is a top-level attribute containing the full verbatim body of the primary vulnerable Swift item as it existed AFTER the fix, showing the patched line(s).
+- Both `vulnerable_function_pre` and `vulnerable_function_post` must be complete, syntactically valid Swift source code extracted from the repository at `pre_state` and `post_state` respectively.
+- If the primary vulnerable item is defined inside a type or extension, preserve the full item body and identify it using a stable name such as `TypeName.methodName`, `TypeName.init`, `TypeName.subscript`, or `TypeName.propertyName`.
+
+====================
+PATCH UNTANGLING RULES
+====================
+- Do not assume every changed hunk in the fix commit is vulnerability-relevant.
+- Separate the patch into:
+  1. `security_fix_hunks`
+  2. `supporting_hunks`
+  3. `unrelated_hunks`
+- A hunk is `security_fix_hunk` only if it directly changes the vulnerable condition, exploitability path, bounds check, optional handling, throwing behavior, authorization condition, parser validation, path validation, deserialization validation, concurrency safety, actor isolation, Sendable correctness, unsafe API precondition, pointer validity, integer/length validation, ARC/lifetime-sensitive logic, or other root-cause-bearing logic.
+- A hunk is `supporting_hunk` if it is required for the security fix to compile, preserve invariants, update protocol/extension conformance, propagate error handling, maintain actor/sendable correctness, or keep behavior coherent, but is not itself the primary vulnerable region.
+- A hunk is `unrelated_hunk` if it is test-only, formatting-only, SwiftFormat-only, comment-only, logging-only, rename-only, refactor-only, or otherwise not required to explain or fix the vulnerability.
+- `vulnerable_line_ranges` must be compact inclusive ranges for the same pre-fix vulnerable region, formatted as `[[start_line, end_line], ...]`.
+- Preserve the full patch diff in `patch.diff`, but separately identify which hunks are vulnerability-relevant.
+- If a changed file contains both relevant and irrelevant hunks, do not mark the entire file as vulnerable; isolate the specific hunk or region.
+- If uncertainty remains about whether a hunk is supporting vs unrelated, prefer `supporting_hunk` and explain the reason in the hunk annotation.
+
+====================
+SWIFT VULNERABILITY ANALYSIS FOCUS
+====================
+When applicable, analyze whether the vulnerability involves one or more of:
+- crash-triggered denial of service from `fatalError`, forced unwrap, forced cast, precondition failure, or out-of-bounds access
+- incorrect optional handling
+- invalid index or range assumptions
+- integer overflow, truncation, sign conversion, or length mismatch
+- parser or deserialization flaws
+- file path, URL, archive, symlink, or permission handling issues
+- authorization or validation bypass
+- misuse of `try!`, `as!`, `unsafelyUnwrapped`, `withoutActuallyEscaping`, or `unsafeBitCast`
+- unsafe pointer misuse (`UnsafePointer`, `UnsafeMutablePointer`, raw buffer pointers, unmanaged objects)
+- Objective-C / C / Foundation interop contract violations
+- race conditions, actor isolation violations, non-Sendable sharing, task cancellation misuse, or async reentrancy issues
+- resource exhaustion, infinite loop, or unbounded allocation
+- data leakage through logging, encoding, serialization, or URL handling
+- ARC lifetime misuse, retain cycle side effects, or deinit-sensitive cleanup bugs when relevant
+
+====================
+STRICT OUTPUT RULES
+====================
+- Output VALID JSON only
+- No markdown fences
+- No prose outside JSON
+- No extra top-level keys
+- `unresolved_identifiers` must be an array, possibly empty
+- `patch.diff` must be the complete unified diff for the true fix scope
+- Use normalized severity:
+  LOW | MEDIUM | HIGH | CRITICAL | NONE | UNKNOWN
+- Use `vulnerable_line_ranges` as compact inclusive ranges `[[start_line, end_line], ...]` from the same pre-fix vulnerable region
+- If the true fix spans multiple files, include all of them in `patch.files`
+- `vulnerable_function_pre` must be a non-empty string containing the complete pre-fix item body
+- `vulnerable_function_post` must be a non-empty string containing the complete post-fix item body
+- All `resolved_identifiers[].definition` fields must contain actual Swift code definitions, not English descriptions
+- For each `resolved_identifiers[]` item with executable kind, `function_body` must be present and non-empty
+- `primary_vulnerable_region` must refer to the root-cause-bearing pre-fix code region only
+- `patch_relevance` must be present even if one or more of its arrays are empty
+
+====================
+OUTPUT SCHEMA
+====================
+{
+  "id": "<cve>__<file_path_sanitized>__<primary_item>",
+  "cve_id": "<string>",
+  "repo": "<string>",
+  "repo_url": "<string>",
+  "selection_source": "<string>",
+  "language": "Swift",
+  "package_name": "<SwiftPM package name or UNKNOWN>",
+  "module_name": "<Swift module name or UNKNOWN>",
+  "file_path": "<primary vulnerable file path>",
+  "item_kind": "<function|method|initializer|deinitializer|property|subscript|macro|other>",
+  "primary_function": "<primary vulnerable item name>",
+  "declaring_type": "<type name or null>",
+  "extension_context": {
+    "extended_type": "<type name or null>",
+    "protocol_conformances": ["<protocol>", "..."]
+  },
+  "helper_functions": ["<item>", "..."],
+  "commit": "<fix commit sha>",
+  "pre_state": "<parent commit sha>",
+  "post_state": "<fix commit sha>",
+  "swift_version": "<5.x|6.x|unknown>",
+  "platform_conditions": ["<availability/cfg condition>", "..."],
+  "imports": ["<module>", "..."],
+  "cwe": "<CWE-ID or UNKNOWN>",
+  "severity": "<LOW|MEDIUM|HIGH|CRITICAL|NONE|UNKNOWN>",
+  "vulnerable": <true|false>,
+  "vulnerable_line_ranges": [[<int>, <int>], "..."],
+  "vulnerable_function_pre": "<full item body from pre-state>",
+  "vulnerable_function_post": "<full item body from post-state>",
+  "primary_vulnerable_region": {
+    "file": "<path>",
+    "lines": [<int>, "..."],
+    "reason": "<precise explanation of why this is the root-cause-bearing pre-fix region>"
+  },
+  "root_cause": "<precise repository-grounded explanation>",
+  "impact": "<short impact summary>",
+  "exploitability_summary": "<short exploitability summary>",
+  "attack_preconditions": ["<string>", "..."],
+  "call_chain": [
+    {
+      "function": "<string>",
+      "file": "<string>",
+      "role": "<entry|caller|callee|sink|helper>"
+    }
+  ],
+  "concurrency_context": {
+    "uses_async": <true|false>,
+    "uses_await": <true|false>,
+    "uses_actor_isolation": <true|false>,
+    "sendable_relevance": "<none|present|critical>"
+  },
+  "interop_context": {
+    "uses_foundation": <true|false>,
+    "uses_objc_bridge": <true|false>,
+    "uses_c_ffi": <true|false>,
+    "unsafe_api_usage": ["<api>", "..."]
+  },
+  "panic_behavior": {
+    "can_trap": <true|false>,
+    "trap_sites": [<int>, "..."],
+    "trap_mechanisms": ["<fatalError|precondition|!|as!|try!|index|other>", "..."]
+  },
+  "error_handling_style": "<throws|Result|optional|mixed|unknown>",
+  "visibility": {
+    "is_public_api": <true|false>,
+    "public_entrypoints": ["<public item>", "..."]
+  },
+  "control_flow_summary": "<string>",
+  "data_flow_summary": "<string>",
+  "memory_lifetime_notes": "<string>",
+  "dependency_context": {
+    "external_packages": ["<package>", "..."],
+    "relevant_protocols": ["<protocol>", "..."]
+  },
+  "resolved_identifiers": [
+    {
+      "name": "<identifier>",
+      "kind": "<function|method|initializer|deinitializer|property|subscript|protocol|extension|macro|struct|class|enum|actor|type_alias|const|global|field|module|other>",
+      "definition": "<actual Swift code definition or full item body>",
+      "function_body": "<full body when executable kind; otherwise empty string>",
+      "location": "<file:line or file range>",
+      "relevance": "<why this identifier matters>"
+    }
+  ],
+  "unresolved_identifiers": ["<identifier>", "..."],
+  "patch": {
+    "files": ["<path>", "..."],
+    "diff": "<full unified diff>",
+    "scope_summary": "<short summary of patch scope>"
+  },
+  "patch_relevance": {
+    "security_fix_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk directly fixes the vulnerability>"
+      }
+    ],
+    "supporting_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk supports but does not directly implement the fix>"
+      }
+    ],
+    "unrelated_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk is not vulnerability-relevant>"
+      }
+    ]
+  },
+  "validation": {
+    "grounded_in_commit": <true|false>,
+    "patch_matches_post_state": <true|false>,
+    "analysis_matches_pre_state": <true|false>
+  },
+  "context_quality": {
+    "callees_resolved": <int>,
+    "types_resolved": <int>,
+    "macros_resolved": <int>,
+    "callers_found": <int>,
+    "unresolved": <int>,
+    "coverage_score": <float_0_to_1>,
+    "method": "opencode_glm5_hybrid_semantic"
+  },
+  "validator_quality": "high",
+  "schema_version": "canonical_swift_v1"
+}
+
+====================
+NORMALIZATION RULES
+====================
+- `primary_function` should be the main Swift item whose behavior best represents the vulnerability
+- Use stable naming for methods and initializers where helpful, e.g. `Type.method`, `Type.init`, `Type.subscript`
+- `helper_functions` should include only directly relevant items
+- `cwe` must be a single normalized string, not an array
+- `severity` must be a single normalized string
+- `vulnerable_line_ranges` must be inclusive pre-fix ranges in the form `[[start_line, end_line], ...]`
+- `resolved_identifiers` should be concise but sufficient to reconstruct reasoning
+- `unresolved_identifiers` must list any symbols still not grounded after exhaustive search
+- If a detail is uncertain, prefer explicit uncertainty in the relevant text field rather than hallucination
+- `primary_vulnerable_region.lines` should normally align with `vulnerable_line_ranges`
+- `security_fix_hunks` should capture direct vulnerability-bearing changes only, not the full patch by default
+
+====================
+INTERNAL WORKFLOW YOU MUST FOLLOW
+====================
+Before producing the JSON:
+1. Determine the parent of `{COMMIT_HASH}` and set it as `pre_state`
+2. Inspect the fix commit and determine the true patch scope
+3. Identify the primary vulnerable Swift item in `{SOURCE_FILE}` or the touched file set
+4. Determine the package name and module name for the primary item if possible
+5. Determine whether the primary item is a free function, method, initializer, deinitializer, property, subscript, or macro-expanded callable
+6. Extract the complete pre-fix item body for the primary vulnerable item from `pre_state`
+7. Extract the complete post-fix item body for the primary vulnerable item from `post_state`
+8. Inspect the surrounding implementation and directly relevant helpers, protocols, extensions, macros, type definitions, globals, and imported APIs
+9. Resolve relevant types, protocols, extensions, constants, globals, macros, helper bodies, and imported APIs from the repository
+10. Recover the exploitability-relevant call chain
+11. Identify the root-cause-bearing pre-fix region
+12. Determine whether concurrency context, actor isolation, Sendable constraints, Objective-C/C interop, trap behavior, or memory-lifetime behavior materially affect exploitability
+13. Partition all changed hunks into `security_fix_hunks`, `supporting_hunks`, and `unrelated_hunks`
+14. Verify that the vulnerability explanation matches the pre-fix code
+15. Verify that the patch matches the post-fix code
+16. Count unresolved identifiers and set both `unresolved_identifiers` and `context_quality.unresolved`
+17. Verify the final JSON is parseable
+
+====================
+FINAL SELF-CHECK
+====================
+Do not output until all are true:
+1. `pre_state` is the real parent of `{COMMIT_HASH}`
+2. `primary_function` is the true primary vulnerable Swift item
+3. `patch.diff` matches the audited fix scope
+4. `context_quality.unresolved` equals the number of items in `unresolved_identifiers`
+5. `vulnerable_function_pre` is present, non-empty, and contains a complete Swift item body with opening and closing braces
+6. `vulnerable_function_post` is present, non-empty, and contains a complete Swift item body with opening and closing braces
+7. Every `resolved_identifier` with executable kind has a `definition` field containing a complete body, not just a signature
+8. Every `resolved_identifier` with executable kind has `function_body` present and non-empty, containing a complete body
+9. No `definition` field in `resolved_identifiers` contains plain English instead of code
+10. All code definitions are syntactically plausible Swift source code
+11. `primary_vulnerable_region` is present and refers only to the true root-cause-bearing pre-fix region
+12. `patch_relevance.security_fix_hunks`, `patch_relevance.supporting_hunks`, and `patch_relevance.unrelated_hunks` are all present
+13. No changed hunk that is clearly unrelated is mislabeled as a security fix hunk
+14. The final JSON is valid and complete
+
+Now produce the final canonical JSON object only. Save it as a valid json file.

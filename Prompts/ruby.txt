@@ -1,0 +1,323 @@
+You are generating EXACTLY ONE canonical vulnerability record from audited repository history.
+
+Your job is to recover repository-grounded facts from the audited commit and surrounding code, not to generate a chat conversation.
+
+You must:
+1. inspect the pre-fix and post-fix repository state,
+2. identify the primary vulnerable executable unit,
+3. resolve all identifiers necessary to explain exploitability and the fix,
+4. recover inter-procedural context and control-flow, data-flow, dispatch-flow, and exception-flow,
+5. recover runtime loading, mixin, refinement, and metaprogramming context where relevant,
+6. reconstruct the full real fix scope,
+7. extract the complete pre-fix and post-fix primary vulnerable unit bodies,
+8. untangle vulnerability-relevant hunks from supporting or unrelated hunks,
+9. output exactly one valid JSON object following the schema below.
+
+Treat the CVE and commit as grounding metadata, not as proof of the exact bug mechanism.
+Do not invent identifiers, helper methods, locations, definitions, vulnerable regions, or patch hunks.
+
+====================
+INPUT ROW
+====================
+- cve_id: {CVE_ID}
+- commit_hash: {COMMIT_HASH}
+- selection_source: {SELECTION_SOURCE}
+- repo_name: {REPO_NAME}
+- repo_url: {REPO_URL}
+- commit_urls: {COMMIT_URLS}
+- source_file: {SOURCE_FILE}
+
+====================
+REPOSITORY ANALYSIS REQUIREMENTS
+====================
+- Resolve all identifiers required for exploitability or patch understanding:
+  - instance methods
+  - class methods
+  - singleton methods
+  - module functions
+  - modules, classes, nested modules, nested classes
+  - mixins introduced via `include`, `prepend`, or `extend`
+  - refinements and refined methods
+  - constants
+  - aliases and `alias_method`
+  - instance variables, class variables, global variables, and relevant attributes
+  - exceptions and custom exception classes
+  - blocks, yielded blocks, Proc objects, lambdas, and relevant closures
+  - metaprogramming hooks such as `define_method`, `class_eval`, `module_eval`, `instance_eval`, `send`, `public_send`, `method_missing`, and `respond_to_missing?` when relevant
+  - load-time/runtime hooks such as `require`, `require_relative`, `autoload`, and code executed in class/module bodies when relevant
+- Recover the caller/callee chain relevant to exploitability
+- Recover attacker-controlled input path where relevant
+- Recover dynamic dispatch paths, including method dispatch modified by mixins, aliasing, method_missing/respond_to_missing?, or metaprogramming, when relevant
+- Recover patch scope across all changed files and hunks
+- If a symbol is still unresolved after exhaustive repository search, keep it in `unresolved_identifiers`
+- Prefer exact repository-grounded definitions over paraphrases
+- Prefer exact patch fidelity over explanatory creativity
+- Do not over-resolve unrelated symbols; only include identifiers material to exploitability, control flow, data flow, authorization, validation, serialization/deserialization, runtime loading, exception behavior, dispatch behavior, or the fix
+
+====================
+RUBY-SPECIFIC REFINEMENTS
+====================
+- Add `primary_qualified_name` as the fully qualified symbol path using Ruby-style naming:
+  - `Module::Function`
+  - `Module::Class#instance_method`
+  - `Module::Class.class_method`
+  - `Module.singleton_method`
+  - `Module::Refinement#refined_method`
+  - or the closest accurate executable-unit path available from repository context
+- Add `primary_unit_kind` to classify the vulnerable executable unit:
+  - `instance_method`
+  - `class_method`
+  - `singleton_method`
+  - `module_function`
+  - `block_body`
+  - `class_body`
+  - `module_body`
+  - `refinement_method`
+  - `other`
+- The primary vulnerable unit may be a:
+  - method defined with `def`
+  - singleton/class method
+  - module function
+  - block body passed to a method and yielded/executed later
+  - class body or module body whose execution itself is security-relevant
+  - refinement-defined method
+  - or other executable Ruby code unit
+- For attributes and variables, resolve the most relevant assignment site, accessor declaration, attr_* declaration, class/module-body declaration, or metaprogramming-origin site that explains exploitability
+- If a mixin (`include`, `prepend`, `extend`) materially changes dispatch, visibility, authorization, validation, or exception behavior, include it in `resolved_identifiers` and explain its effect
+- If a refinement materially changes dispatch, include it in `resolved_identifiers` and explain its scope and effect
+- If metaprogramming materially changes available methods, method visibility, dispatch, validation, serialization, or authorization, include the metaprogramming site in `resolved_identifiers` and explain its effect
+- If the vulnerable unit is decorated by class/module context, singleton class context, or aliasing, preserve that context enough for the extracted code to remain semantically understandable
+- Preserve `def`, `class << self`, `module_function`, `private`, `protected`, `public`, `rescue`, `ensure`, `yield`, `super`, and aliasing exactly where relevant
+- Preserve indentation and `end` structure exactly enough for extracted code to remain valid Ruby source
+
+====================
+IDENTIFIER DEFINITION RULES
+====================
+- Every identifier with kind = `instance_method`, `class_method`, `singleton_method`, `module_function`, `refinement_method`, or `block_body` MUST include the COMPLETE executable body as the `definition` value, not just a method name or one-line signature
+- Every identifier with those executable-unit kinds MUST include `unit_body`, and it MUST contain the COMPLETE body as valid Ruby source code
+- The `definition` field for executable units MUST be valid Ruby source code, not plain English
+- The `definition` field for modules, classes, mixins, refinements, constants, aliases, exceptions, attributes, variables, and metaprogramming sites MUST be the actual code definition or the most relevant code-origin site, not an English description
+- `vulnerable_unit_pre` is a top-level attribute containing the full verbatim body of the primary vulnerable executable unit as it existed BEFORE the fix, including the vulnerable line(s)
+- `vulnerable_unit_post` is a top-level attribute containing the full verbatim body of the primary vulnerable executable unit as it existed AFTER the fix, showing the patched line(s)
+- Both `vulnerable_unit_pre` and `vulnerable_unit_post` must be complete, syntactically valid Ruby executable-unit bodies extracted from the repository at `pre_state` and `post_state` respectively
+- Preserve `def ... end`, singleton-class context, module/class wrappers when required to make the unit understandable, and any relevant `private`/`protected` visibility markers
+- Preserve `begin`/`rescue`/`ensure` structure exactly when applicable
+- Preserve block delimiters (`do ... end` or `{ ... }`) when the primary vulnerable unit is a block or depends on a block body
+
+====================
+PATCH UNTANGLING RULES
+====================
+- Do not assume every changed hunk in the fix commit is vulnerability-relevant
+- Separate the patch into:
+  1. `security_fix_hunks`
+  2. `supporting_hunks`
+  3. `unrelated_hunks`
+- A hunk is `security_fix_hunk` only if it directly changes the vulnerable condition, exploitability path, unsafe state transition, missing validation, boundary check, authorization condition, deserialization/serialization validation, path validation, recursion/iteration bound, resource exhaustion guard, exception safety, dispatch behavior, method visibility, runtime loading behavior, or other root-cause-bearing logic
+- A hunk is `supporting_hunk` if it is required for the security fix to preserve runtime behavior, loadability, compatibility, framework integration, exception behavior, dispatch behavior, or safe propagation of the fix, but is not itself the primary vulnerable region
+- A hunk is `unrelated_hunk` if it is test-only, formatting-only, comment-only, documentation-only, logging-only, refactor-only, rename-only, dead-code-only, or otherwise not required to explain or fix the vulnerability
+- `vulnerable_line_ranges` must be compact inclusive ranges for the same pre-fix vulnerable region, formatted as `[[start_line, end_line], ...]`
+- Preserve the full patch diff in `patch.diff`, but separately identify which hunks are vulnerability-relevant
+- If a changed file contains both relevant and irrelevant hunks, do not mark the entire file as vulnerable; isolate the specific hunk or region
+- If uncertainty remains about whether a hunk is supporting vs unrelated, prefer `supporting_hunk` and explain the reason in the hunk annotation
+
+====================
+STRICT OUTPUT RULES
+====================
+- Output VALID JSON only
+- No markdown fences
+- No prose outside JSON
+- No extra top-level keys
+- `unresolved_identifiers` must be an array, possibly empty
+- `patch.diff` must be the complete unified diff for the true fix scope
+- Use normalized severity:
+  LOW | MEDIUM | HIGH | CRITICAL | NONE | UNKNOWN
+- Use `vulnerable_line_ranges` as compact inclusive ranges `[[start_line, end_line], ...]` from the same pre-fix vulnerable region
+- If the true fix spans multiple files, include all of them in `patch.files`
+- `vulnerable_unit_pre` must be a non-empty string containing the complete pre-fix executable-unit body
+- `vulnerable_unit_post` must be a non-empty string containing the complete post-fix executable-unit body
+- All `resolved_identifiers[].definition` fields must contain actual code definitions, not English descriptions
+- For each `resolved_identifiers[]` item with executable-unit kinds, `unit_body` must be present and non-empty
+- `primary_vulnerable_region` must refer to the root-cause-bearing pre-fix code region only
+- `patch_relevance` must be present even if one or more of its arrays are empty
+
+====================
+OUTPUT SCHEMA
+====================
+{
+  "id": "<cve>__<file_path_sanitized>__<primary_unit_name>",
+  "cve_id": "<string>",
+  "repo": "<string>",
+  "repo_url": "<string>",
+  "selection_source": "<string>",
+  "language": "Ruby",
+  "file_path": "<primary vulnerable file path>",
+  "module_path": "<ruby file load path or logical module path>",
+  "primary_unit_name": "<primary vulnerable executable-unit short name>",
+  "primary_qualified_name": "<fully qualified Ruby symbol path for the primary vulnerable executable unit>",
+  "primary_unit_kind": "<instance_method|class_method|singleton_method|module_function|block_body|class_body|module_body|refinement_method|other>",
+  "containing_module": "<module name or empty string>",
+  "containing_class": "<class name or empty string>",
+  "helper_functions": ["<helper executable units>", "..."],
+  "commit": "<fix commit sha>",
+  "pre_state": "<parent commit sha>",
+  "post_state": "<fix commit sha>",
+  "cwe": "<CWE-ID or UNKNOWN>",
+  "severity": "<LOW|MEDIUM|HIGH|CRITICAL|NONE|UNKNOWN>",
+  "vulnerable": <true|false>,
+  "vulnerable_line_ranges": [[<int>, <int>], "..."],
+  "vulnerable_unit_pre": "<full executable-unit body from the pre-fix version, as verbatim Ruby source code string>",
+  "vulnerable_unit_post": "<full executable-unit body from the post-fix version, as verbatim Ruby source code string>",
+  "primary_vulnerable_region": {
+    "file": "<path>",
+    "lines": [<int>, "..."],
+    "reason": "<precise explanation of why this is the root-cause-bearing pre-fix region>"
+  },
+  "root_cause": "<precise repository-grounded explanation>",
+  "impact": "<short impact summary>",
+  "exploitability_summary": "<short exploitability summary>",
+  "attack_preconditions": ["<string>", "..."],
+  "execution_context": {
+    "framework": "<rails|rack|sinatra|hanami|sidekiq|resque|ruby_stdlib|custom|unknown>",
+    "entrypoint_type": "<controller_action|rack_middleware|background_job|cli|deserializer|callback|initializer|load_time_side_effect|other>",
+    "notes": "<short explanation>"
+  },
+  "call_chain": [
+    {
+      "function": "<string>",
+      "file": "<string>",
+      "role": "<entry|caller|callee|sink|helper>"
+    }
+  ],
+  "control_flow_summary": "<string>",
+  "data_flow_summary": "<string>",
+  "dispatch_summary": "<string>",
+  "exception_flow_summary": "<string>",
+  "load_resolution_summary": "<string>",
+  "object_lifecycle_summary": "<string>",
+  "input_model_summary": "<string>",
+  "resolved_identifiers": [
+    {
+      "name": "<identifier>",
+      "kind": "<instance_method|class_method|singleton_method|module_function|block_body|class|module|mixin|refinement|constant|alias|exception|attribute|instance_variable|class_variable|global_variable|metaprogramming_hook|other>",
+      "definition": "<actual Ruby code definition or full executable-unit body>",
+      "unit_body": "<full executable-unit body when applicable; otherwise empty string>",
+      "location": "<file:line or file range>",
+      "relevance": "<why this identifier matters>"
+    }
+  ],
+  "unresolved_identifiers": ["<identifier>", "..."],
+  "patch": {
+    "files": ["<path>", "..."],
+    "diff": "<full unified diff>",
+    "scope_summary": "<short summary of patch scope>"
+  },
+  "patch_relevance": {
+    "security_fix_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk directly fixes the vulnerability>"
+      }
+    ],
+    "supporting_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk supports but does not directly implement the fix>"
+      }
+    ],
+    "unrelated_hunks": [
+      {
+        "file": "<path>",
+        "pre_lines": [<int>, "..."],
+        "post_lines": [<int>, "..."],
+        "reason": "<why this hunk is not vulnerability-relevant>"
+      }
+    ]
+  },
+  "validation": {
+    "grounded_in_commit": <true|false>,
+    "patch_matches_post_state": <true|false>,
+    "analysis_matches_pre_state": <true|false>
+  },
+  "context_quality": {
+    "callees_resolved": <int>,
+    "classes_resolved": <int>,
+    "modules_resolved": <int>,
+    "mixins_resolved": <int>,
+    "dynamic_dispatch_resolved": <int>,
+    "callers_found": <int>,
+    "unresolved": <int>,
+    "coverage_score": <float_0_to_1>,
+    "method": "opencode_glm5_hybrid_semantic"
+  },
+  "validator_quality": "high",
+  "schema_version": "canonical_v1_ruby"
+}
+
+====================
+NORMALIZATION RULES
+====================
+- `primary_unit_name` should be the main executable-unit short name whose behavior best represents the vulnerability
+- `primary_qualified_name` should be used for disambiguation and downstream rendering
+- `helper_functions` should include only directly relevant helpers
+- `cwe` must be a single normalized string, not an array
+- `severity` must be a single normalized string
+- `vulnerable_line_ranges` must be inclusive pre-fix ranges in the form `[[start_line, end_line], ...]`
+- `resolved_identifiers` should be concise but sufficient to reconstruct reasoning
+- `unresolved_identifiers` must list any symbols still not grounded after exhaustive search
+- If a detail is uncertain, prefer explicit uncertainty in the relevant text field rather than hallucination
+- `primary_vulnerable_region.lines` should normally align with `vulnerable_line_ranges`
+- `security_fix_hunks` should capture direct vulnerability-bearing changes only, not the full patch by default
+- For instance methods, prefer `Module::Class#method_name`
+- For class or singleton methods, prefer `Module::Class.method_name`
+- For module functions, prefer `Module.method_name`
+- Preserve aliasing relationships and mixin/refinement effects when they materially affect dispatch or exploitability
+
+====================
+INTERNAL WORKFLOW YOU MUST FOLLOW
+====================
+Before producing the JSON:
+1. Determine the parent of `{COMMIT_HASH}` and set it as `pre_state`
+2. Inspect the fix commit and determine the true patch scope
+3. Identify the primary vulnerable executable unit in `{SOURCE_FILE}` or the touched file set
+4. Extract the complete pre-fix body for the primary vulnerable executable unit from `pre_state`
+5. Extract the complete post-fix body for the primary vulnerable executable unit from `post_state`
+6. Inspect the surrounding implementation and directly relevant helpers
+7. Resolve relevant modules, classes, instance methods, class methods, singleton methods, aliases, mixins, refinements, constants, variables, exceptions, blocks, procs/lambdas, and metaprogramming hooks from the repository
+8. Recover the exploitability-relevant call chain
+9. Recover dispatch paths affected by include/prepend/extend, singleton-class behavior, aliasing, send/public_send, method_missing/respond_to_missing?, and metaprogramming when relevant
+10. Recover exception-flow through begin/rescue/ensure/raise and cleanup behavior when relevant
+11. Recover runtime load/require/autoload/initializer behavior when relevant
+12. Identify the root-cause-bearing pre-fix region
+13. Partition all changed hunks into `security_fix_hunks`, `supporting_hunks`, and `unrelated_hunks`
+14. Verify that the vulnerability explanation matches the pre-fix code
+15. Verify that the patch matches the post-fix code
+16. Count unresolved identifiers and set both `unresolved_identifiers` and `context_quality.unresolved`
+17. Verify the final JSON is parseable
+
+====================
+FINAL SELF-CHECK
+====================
+Do not output until all are true:
+1. `pre_state` is the real parent of `{COMMIT_HASH}`
+2. `primary_unit_name` is the true primary vulnerable executable-unit short name
+3. `primary_qualified_name` correctly disambiguates the vulnerable unit
+4. `patch.diff` matches the audited fix scope
+5. `context_quality.unresolved` equals the number of items in `unresolved_identifiers`
+6. `vulnerable_unit_pre` is present, non-empty, and contains a complete executable-unit body
+7. `vulnerable_unit_post` is present, non-empty, and contains a complete executable-unit body
+8. `vulnerable_line_ranges` is present and uses inclusive `[[start,end], ...]` pairs
+9. Every executable-unit identifier has a `definition` field containing a complete body, not just a name
+10. Every executable-unit identifier has `unit_body` present and non-empty, containing a complete body
+11. No `definition` field in `resolved_identifiers` contains plain English instead of code
+12. All code definitions are syntactically plausible Ruby source code with correct `end` structure
+13. `primary_vulnerable_region` is present and refers only to the true root-cause-bearing pre-fix region
+14. `patch_relevance.security_fix_hunks`, `patch_relevance.supporting_hunks`, and `patch_relevance.unrelated_hunks` are all present
+15. No changed hunk that is clearly unrelated is mislabeled as a security fix hunk
+16. Mixins, refinements, aliasing, or metaprogramming effects are captured when they materially affect exploitability
+17. The final JSON is valid and complete
+
+Now produce the final canonical JSON object only. Save it as a valid JSON file.

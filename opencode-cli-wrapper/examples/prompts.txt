@@ -1,0 +1,3 @@
+Generate a vulnerable C function with a stack buffer overflow and explain the exploit path.
+Generate a vulnerable Python Flask route with SQL injection and provide a proof-of-concept payload.
+Generate a vulnerable Node.js file upload handler with path traversal and show a safe patch.
