@@ -18,13 +18,13 @@ Do not invent identifiers, helper functions, locations, definitions, vulnerable 
 ====================
 INPUT ROW
 ====================
-- cve_id: {CVE_ID}
-- commit_hash: {COMMIT_HASH}
-- selection_source: {SELECTION_SOURCE}
-- repo_name: {REPO_NAME}
-- repo_url: {REPO_URL}
-- commit_urls: {COMMIT_URLS}
-- source_file: {SOURCE_FILE}
+- cve_id: {cve_id}
+- commit_hash: {commit_hash}
+- selection_source: {selection_source}
+- repo_name: {repo_name}
+- repo_url: {repo_url}
+- commit_urls: {commit_urls}
+- source_file: {source_file}
 
 ====================
 REPOSITORY ANALYSIS REQUIREMENTS
@@ -84,6 +84,8 @@ IDENTIFIER DEFINITION RULES
 - `vulnerable_function_pre` is a top-level attribute containing the full verbatim body of the primary vulnerable callable as it existed BEFORE the fix, including the vulnerable line(s).
 - `vulnerable_function_post` is a top-level attribute containing the full verbatim body of the primary vulnerable callable as it existed AFTER the fix, showing the patched line(s).
 - Both `vulnerable_function_pre` and `vulnerable_function_post` must be complete, syntactically valid Kotlin callable definitions extracted from the repository at `pre_state` and `post_state` respectively.
+- Every `resolved_identifiers[]` item MUST include `state` with one of `pre`, `post`, or `both`.
+- Do not collapse changed helper definitions across states into one entry; emit separate `state = "pre"` and `state = "post"` entries when the code differs.
 - If the primary vulnerable logic is in an initializer block, property accessor, lambda assigned to a property, anonymous object method, or companion object method, extract that exact executable code unit and use the nearest stable callable identifier as `primary_function`.
 
 ====================
@@ -125,7 +127,7 @@ PATCH UNTANGLING RULES
 - A hunk is `security_fix_hunk` only if it directly changes the vulnerable condition, exploitability path, nullability guard, lifecycle guard, permission check, parser validation, bounds check, auth logic, serialization contract, concurrency invariant, resource-lifetime rule, or other root-cause-bearing logic.
 - A hunk is `supporting_hunk` if it is required for the security fix to compile, preserve invariants, propagate the fix safely, update dependent logic, or keep behavior coherent, but is not itself the primary vulnerable region.
 - A hunk is `unrelated_hunk` if it is test-only, formatting-only, comment-only, logging-only, refactor-only, rename-only, dead-code-only, or otherwise not required to explain or fix the vulnerability.
-- `vulnerable_lines` must refer only to the true pre-fix vulnerable region in the primary vulnerable file, not every touched line in the commit.
+- `vulnerable_line_ranges` must refer only to the true pre-fix vulnerable region in the primary vulnerable file, not every touched line in the commit.
 - Preserve the full patch diff in `patch.diff`, but separately identify which hunks are vulnerability-relevant.
 - If a changed file contains both relevant and irrelevant hunks, do not mark the entire file as vulnerable; isolate the specific hunk or region.
 - If uncertainty remains about whether a hunk is supporting vs unrelated, prefer `supporting_hunk` and explain the reason in the hunk annotation.
@@ -141,13 +143,16 @@ STRICT OUTPUT RULES
 - `patch.diff` must be the complete unified diff for the true fix scope
 - Use normalized severity:
   LOW | MEDIUM | HIGH | CRITICAL | NONE | UNKNOWN
-- Use `vulnerable_lines` as an array of integers when the primary vulnerable file/callable is clear
+- Use `vulnerable_line_ranges` as compact inclusive ranges [[start_line, end_line], ...] when the primary vulnerable file/callable is clear
 - If the true fix spans multiple files, include all of them in `patch.files`
 - `vulnerable_function_pre` must be a non-empty string containing the complete pre-fix callable definition
 - `vulnerable_function_post` must be a non-empty string containing the complete post-fix callable definition
 - All `resolved_identifiers[].definition` fields must contain actual code definitions, not English descriptions
+- For each `resolved_identifiers[]` item with callable kinds, `function_body` must be present and non-empty
 - `primary_vulnerable_region` must refer to the root-cause-bearing pre-fix code region only
 - `patch_relevance` must be present even if one or more of its arrays are empty
+- Every helper list must be state-specific (`*_pre` for `pre_state`, `*_post` for `post_state`) and must not merge states.
+- Every helper listed in `*_pre` or `*_post` must have at least one matching `resolved_identifiers[]` entry with consistent `state`.
 - Keep `macros_resolved` in `context_quality` for cross-language schema compatibility; for Kotlin it should normally be 0
 
 ====================
@@ -168,14 +173,22 @@ OUTPUT SCHEMA
   "receiver_type": "<string or null>",
   "suspend": <true|false>,
   "visibility": "<public|internal|protected|private|local|unknown>",
-  "helper_functions": ["<function>", "..."],
+  "helper_functions_pre": ["<helper_from_pre_state>", "..."],
+  "helper_functions_post": ["<helper_from_post_state>", "..."],
+  "helper_function_pairs": [
+    {
+      "pre": "<helper_from_pre_state_or_empty>",
+      "post": "<helper_from_post_state_or_empty>",
+      "change": "<unchanged|modified|renamed|added|removed>"
+    }
+  ],
   "commit": "<fix commit sha>",
   "pre_state": "<parent commit sha>",
   "post_state": "<fix commit sha>",
   "cwe": "<CWE-ID or UNKNOWN>",
   "severity": "<LOW|MEDIUM|HIGH|CRITICAL|NONE|UNKNOWN>",
   "vulnerable": <true|false>,
-  "vulnerable_lines": [<int>, "..."],
+  "vulnerable_line_ranges": [[<int>, <int>], "..."],
   "vulnerable_function_pre": "<full callable definition from pre-state>",
   "vulnerable_function_post": "<full callable definition from post-state>",
   "primary_vulnerable_region": {
@@ -230,6 +243,8 @@ OUTPUT SCHEMA
       "name": "<identifier>",
       "kind": "<class|object|companion_object|interface|enum|enum_entry|typealias|function|constructor|property|backing_field|getter|setter|constant|annotation|lambda|other>",
       "definition": "<actual code definition or full callable definition>",
+      "function_body": "<full callable definition when kind is callable-like; otherwise empty string>",
+      "state": "<pre|post|both>",
       "location": "<file:line or file range>",
       "relevance": "<why this identifier matters>"
     }
@@ -288,23 +303,24 @@ OUTPUT SCHEMA
 NORMALIZATION RULES
 ====================
 - `primary_function` should be the main callable whose behavior best represents the vulnerability
-- `helper_functions` should include only directly relevant helpers
+- `helper_functions_pre` and `helper_functions_post` must include only directly relevant helpers from their respective states
+- `helper_function_pairs` should map helper identity across states and encode unchanged/modified/renamed/added/removed transitions
 - `cwe` must be a single normalized string, not an array
 - `severity` must be a single normalized string
-- `vulnerable_lines` must be line numbers from the pre-fix state for the primary vulnerable file
+- `vulnerable_line_ranges` must be inclusive pre-fix ranges in the form `[[start_line, end_line], ...]`
 - `resolved_identifiers` should be concise but sufficient to reconstruct reasoning
 - `unresolved_identifiers` must list any symbols still not grounded after exhaustive search
 - If a detail is uncertain, prefer explicit uncertainty in the relevant text field rather than hallucination
-- `primary_vulnerable_region.lines` should normally be a subset of or equal to `vulnerable_lines`
+- `primary_vulnerable_region.lines` should normally align with `vulnerable_line_ranges`
 - `security_fix_hunks` should capture direct vulnerability-bearing changes only, not the full patch by default
 
 ====================
 INTERNAL WORKFLOW YOU MUST FOLLOW
 ====================
 Before producing the JSON:
-1. Determine the parent of `{COMMIT_HASH}` and set it as `pre_state`
+1. Determine the parent of `{commit_hash}` and set it as `pre_state`
 2. Inspect the fix commit and determine the true patch scope
-3. Identify the primary vulnerable callable in `{SOURCE_FILE}` or the touched file set
+3. Identify the primary vulnerable callable in `{source_file}` or the touched file set
 4. Extract the complete pre-fix callable definition for the primary vulnerable callable from `pre_state`
 5. Extract the complete post-fix callable definition for the primary vulnerable callable from `post_state`
 6. Inspect the surrounding implementation and directly relevant helpers
@@ -321,18 +337,19 @@ Before producing the JSON:
 FINAL SELF-CHECK
 ====================
 Do not output until all are true:
-1. `pre_state` is the real parent of `{COMMIT_HASH}`
+1. `pre_state` is the real parent of `{commit_hash}`
 2. `primary_function` is the true primary vulnerable callable
 3. `patch.diff` matches the audited fix scope
 4. `context_quality.unresolved` equals the number of items in `unresolved_identifiers`
 5. `vulnerable_function_pre` is present, non-empty, and contains a complete callable definition
 6. `vulnerable_function_post` is present, non-empty, and contains a complete callable definition
 7. Every `resolved_identifier` with kind = "function" has a `definition` field containing a complete callable definition, not just a signature
-8. No `definition` field in `resolved_identifiers` contains plain English instead of code
-9. All code definitions are syntactically plausible Kotlin source code
-10. `primary_vulnerable_region` is present and refers only to the true root-cause-bearing pre-fix region
-11. `patch_relevance.security_fix_hunks`, `patch_relevance.supporting_hunks`, and `patch_relevance.unrelated_hunks` are all present
-12. No changed hunk that is clearly unrelated is mislabeled as a security fix hunk
-13. The final JSON is valid and complete
+8. Every callable `resolved_identifier` has `function_body` present and non-empty
+9. No `definition` field in `resolved_identifiers` contains plain English instead of code
+10. All code definitions are syntactically plausible Kotlin source code
+11. `primary_vulnerable_region` is present and refers only to the true root-cause-bearing pre-fix region
+12. `patch_relevance.security_fix_hunks`, `patch_relevance.supporting_hunks`, and `patch_relevance.unrelated_hunks` are all present
+13. No changed hunk that is clearly unrelated is mislabeled as a security fix hunk
+14. The final JSON is valid and complete
 
 Now produce the final canonical JSON object only.

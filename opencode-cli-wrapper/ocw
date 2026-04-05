@@ -19,7 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from shutil import which
+from shutil import copy2, which
 from threading import Event, Lock
 from typing import Any, Iterable, Sequence
 
@@ -81,6 +81,31 @@ def build_env(all_permissions: bool, xdg_data_home: str | None = None) -> dict[s
     if xdg_data_home:
         env["XDG_DATA_HOME"] = xdg_data_home
     return env
+
+
+def default_xdg_data_home() -> Path:
+    override = os.environ.get("XDG_DATA_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".local" / "share"
+
+
+def seed_auth_if_missing(xdg_data_home: str | None) -> None:
+    if not xdg_data_home:
+        return
+    target = Path(xdg_data_home).expanduser() / "opencode" / "auth.json"
+    if target.exists():
+        return
+
+    source = default_xdg_data_home() / "opencode" / "auth.json"
+    if not source.exists():
+        return
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        copy2(source, target)
+    except OSError as exc:
+        eprint(f"[ocw] warning: could not seed auth credentials to {target}: {exc}")
 
 
 def _safe_worker_key(value: str) -> str:
@@ -363,34 +388,107 @@ def run_prompt_once(
     all_permissions: bool,
     xdg_data_home: str | None,
     worker_slot: int,
+    timeout_seconds: float | None,
+    fallback_model: str | None,
 ) -> dict[str, object]:
     command = [binary, "run", prompt, *base_passthrough]
+    seed_auth_if_missing(xdg_data_home)
     started_monotonic = time.monotonic()
     started_at = now_iso()
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        check=False,
-        env=build_env(all_permissions=all_permissions, xdg_data_home=xdg_data_home),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    env = build_env(all_permissions=all_permissions, xdg_data_home=xdg_data_home)
+
+    def run_with_timeout(run_command_items: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            run_command_items,
+            cwd=cwd,
+            check=False,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+        )
+
+    timed_out = False
+    fallback_used = False
+    primary_exit_code = 0
+    completed: subprocess.CompletedProcess[str] | None = None
+    command_used = list(command)
+    stderr_prefix = ""
+
+    try:
+        completed = run_with_timeout(command)
+        primary_exit_code = completed.returncode
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        primary_exit_code = 124
+        stderr_prefix = f"[ocw] prompt timed out after {timeout_seconds}s\n"
+        if fallback_model:
+            fallback_used = True
+            fallback_passthrough = list(base_passthrough)
+            fallback_replaced = False
+            for i, item in enumerate(fallback_passthrough):
+                if item == "--model" and i + 1 < len(fallback_passthrough):
+                    fallback_passthrough[i + 1] = fallback_model
+                    fallback_replaced = True
+                    break
+                if item.startswith("--model="):
+                    fallback_passthrough[i] = f"--model={fallback_model}"
+                    fallback_replaced = True
+                    break
+            if not fallback_replaced:
+                fallback_passthrough.extend(["--model", fallback_model])
+
+            fallback_command = [binary, "run", prompt, *fallback_passthrough]
+            command_used = list(fallback_command)
+            try:
+                completed = run_with_timeout(fallback_command)
+            except subprocess.TimeoutExpired:
+                completed = subprocess.CompletedProcess(
+                    args=fallback_command,
+                    returncode=124,
+                    stdout=exc.stdout or "",
+                    stderr=(exc.stderr or "")
+                    + f"\n[ocw] fallback model timed out after {timeout_seconds}s",
+                )
+        else:
+            completed = subprocess.CompletedProcess(
+                args=command,
+                returncode=124,
+                stdout=exc.stdout or "",
+                stderr=(exc.stderr or "") + stderr_prefix.rstrip("\n"),
+            )
+
+    if completed is None:
+        completed = subprocess.CompletedProcess(
+            args=command_used,
+            returncode=1,
+            stdout="",
+            stderr="[ocw] internal error: missing completion object",
+        )
+
     ended_at = now_iso()
     duration_seconds = round(time.monotonic() - started_monotonic, 3)
-    return {
+    record: dict[str, object] = {
         "index": index,
         "worker_slot": worker_slot,
         "xdg_data_home": xdg_data_home,
         "prompt": prompt,
-        "command": command,
+        "command": command_used,
         "exit_code": completed.returncode,
         "started_at": started_at,
         "ended_at": ended_at,
         "duration_seconds": duration_seconds,
         "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "stderr": f"{stderr_prefix}{completed.stderr}" if stderr_prefix else completed.stderr,
     }
+    if timed_out:
+        record["timed_out"] = True
+        record["primary_exit_code"] = primary_exit_code
+    if fallback_used:
+        record["fallback_used"] = True
+        record["fallback_model"] = fallback_model
+    return record
 
 
 def command_run(argv: Sequence[str]) -> int:
@@ -450,6 +548,7 @@ def command_run(argv: Sequence[str]) -> int:
     if args.print_command:
         eprint(f"$ {shlex.join(command)}")
     if xdg_data_home:
+        seed_auth_if_missing(xdg_data_home)
         eprint(f"[ocw] using XDG_DATA_HOME={xdg_data_home}")
 
     return run_command(
@@ -510,6 +609,7 @@ def command_serve(argv: Sequence[str]) -> int:
     if args.print_command:
         eprint(f"$ {shlex.join(command)}")
     if xdg_data_home:
+        seed_auth_if_missing(xdg_data_home)
         eprint(f"[ocw] using XDG_DATA_HOME={xdg_data_home}")
 
     return run_command(
@@ -533,6 +633,8 @@ def iter_batch_records(
     print_command: bool,
     json_events: bool,
     xdg_data_home: str | None,
+    timeout_seconds: float | None,
+    fallback_model: str | None,
 ) -> Iterable[dict[str, object]]:
     base_passthrough = list(passthrough)
     if json_events and not has_option(base_passthrough, "--format"):
@@ -551,6 +653,8 @@ def iter_batch_records(
             all_permissions=all_permissions,
             xdg_data_home=xdg_data_home,
             worker_slot=1,
+            timeout_seconds=timeout_seconds,
+            fallback_model=fallback_model,
         )
         yield record
 
@@ -624,6 +728,19 @@ def command_batch(argv: Sequence[str]) -> int:
     )
     parser.add_argument("--fail-fast", action="store_true", help="Stop after first non-zero exit")
     parser.add_argument("--sleep-seconds", type=float, default=0.0, help="Sleep duration between prompts")
+    parser.add_argument(
+        "--prompt-timeout-seconds",
+        type=float,
+        default=0.0,
+        help="Per-prompt timeout in seconds (0 disables timeout)",
+    )
+    parser.add_argument(
+        "--fallback-model",
+        help=(
+            "Fallback model for timed-out prompts (e.g., provider/model). "
+            "Only used when timeout is enabled and the primary attempt times out."
+        ),
+    )
     parser.add_argument("--print-command", action="store_true", help="Print each command before running")
     parser.add_argument(
         "--respect-opencode-permissions",
@@ -635,6 +752,8 @@ def command_batch(argv: Sequence[str]) -> int:
 
     if args.sleep_seconds < 0:
         raise SystemExit("error: --sleep-seconds must be >= 0")
+    if args.prompt_timeout_seconds < 0:
+        raise SystemExit("error: --prompt-timeout-seconds must be >= 0")
     if args.workers < 1:
         raise SystemExit("error: --workers must be >= 1")
     if args.offset < 0:
@@ -675,6 +794,7 @@ def command_batch(argv: Sequence[str]) -> int:
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    timeout_seconds: float | None = args.prompt_timeout_seconds if args.prompt_timeout_seconds > 0 else None
 
     mode = "a" if args.append else "w"
     stats = {"total": 0, "failures": 0}
@@ -718,6 +838,8 @@ def command_batch(argv: Sequence[str]) -> int:
                     all_permissions=not args.respect_opencode_permissions,
                     xdg_data_home=worker_xdg_homes[0],
                     worker_slot=1,
+                    timeout_seconds=timeout_seconds,
+                    fallback_model=args.fallback_model,
                 )
                 write_record(handle, record)
                 if stop_event.is_set():
@@ -748,6 +870,8 @@ def command_batch(argv: Sequence[str]) -> int:
                         all_permissions=not args.respect_opencode_permissions,
                         xdg_data_home=home,
                         worker_slot=worker_slot,
+                        timeout_seconds=timeout_seconds,
+                        fallback_model=args.fallback_model,
                     )
                     write_record(handle, record)
                     if stop_event.is_set():

@@ -19,13 +19,13 @@ Do not invent identifiers, helper functions, locations, definitions, vulnerable 
 ====================
 INPUT ROW
 ====================
-- cve_id: {CVE_ID}
-- commit_hash: {COMMIT_HASH}
-- selection_source: {SELECTION_SOURCE}
-- repo_name: {REPO_NAME}
-- repo_url: {REPO_URL}
-- commit_urls: {COMMIT_URLS}
-- source_file: {SOURCE_FILE}
+- cve_id: {cve_id}
+- commit_hash: {commit_hash}
+- selection_source: {selection_source}
+- repo_name: {repo_name}
+- repo_url: {repo_url}
+- commit_urls: {commit_urls}
+- source_file: {source_file}
 
 ====================
 REPOSITORY ANALYSIS REQUIREMENTS
@@ -106,6 +106,8 @@ IDENTIFIER DEFINITION RULES
 - `vulnerable_function_pre` is a top-level attribute containing the full verbatim body of the primary vulnerable executable unit as it existed BEFORE the fix, including the vulnerable line(s)
 - `vulnerable_function_post` is a top-level attribute containing the full verbatim body of the primary vulnerable executable unit as it existed AFTER the fix, showing the patched line(s)
 - Both `vulnerable_function_pre` and `vulnerable_function_post` must be complete, syntactically valid Python executable-unit bodies extracted from the repository at `pre_state` and `post_state` respectively
+- Every `resolved_identifiers[]` item MUST include `state` with one of `pre`, `post`, or `both`.
+- Do not collapse changed helper definitions across states into one entry; emit separate `state = "pre"` and `state = "post"` entries when the code differs.
 - Preserve decorators immediately above the executable unit when they are part of the definition
 - Preserve `async def` exactly when applicable
 - Preserve indentation exactly enough for the extracted executable unit to remain valid Python source
@@ -145,6 +147,8 @@ STRICT OUTPUT RULES
 - For each `resolved_identifiers[]` item with executable-unit kinds, `function_body` must be present and non-empty
 - `primary_vulnerable_region` must refer to the root-cause-bearing pre-fix code region only
 - `patch_relevance` must be present even if one or more of its arrays are empty
+- Every helper list must be state-specific (`*_pre` for `pre_state`, `*_post` for `post_state`) and must not merge states.
+- Every helper listed in `*_pre` or `*_post` must have at least one matching `resolved_identifiers[]` entry with consistent `state`.
 
 ====================
 OUTPUT SCHEMA
@@ -162,7 +166,15 @@ OUTPUT SCHEMA
   "primary_qualified_name": "<fully qualified symbol path for the primary vulnerable executable unit>",
   "primary_unit_kind": "<function|method|async_function|async_method|property_getter|property_setter|descriptor_method|class_body|module_init|other>",
   "containing_class": "<class name or empty string>",
-  "helper_functions": ["<function_or_method>", "..."],
+  "helper_functions_pre": ["<helper_from_pre_state>", "..."],
+  "helper_functions_post": ["<helper_from_post_state>", "..."],
+  "helper_function_pairs": [
+    {
+      "pre": "<helper_from_pre_state_or_empty>",
+      "post": "<helper_from_post_state_or_empty>",
+      "change": "<unchanged|modified|renamed|added|removed>"
+    }
+  ],
   "commit": "<fix commit sha>",
   "pre_state": "<parent commit sha>",
   "post_state": "<fix commit sha>",
@@ -205,6 +217,7 @@ OUTPUT SCHEMA
       "kind": "<function|method|async_function|async_method|property_getter|property_setter|descriptor_method|class|decorator|constant|import|alias|exception|attribute|module|other>",
       "definition": "<actual Python code definition or full executable-unit body>",
       "function_body": "<full executable-unit body when applicable; otherwise empty string>",
+      "state": "<pre|post|both>",
       "location": "<file:line or file range>",
       "relevance": "<why this identifier matters>"
     }
@@ -267,7 +280,8 @@ NORMALIZATION RULES
 ====================
 - `primary_function` should be the main executable-unit short name whose behavior best represents the vulnerability
 - `primary_qualified_name` should be used for disambiguation and downstream rendering
-- `helper_functions` should include only directly relevant helpers
+- `helper_functions_pre` and `helper_functions_post` must include only directly relevant helpers from their respective states
+- `helper_function_pairs` should map helper identity across states and encode unchanged/modified/renamed/added/removed transitions
 - `cwe` must be a single normalized string, not an array
 - `severity` must be a single normalized string
 - `vulnerable_line_ranges` must be inclusive pre-fix ranges in the form `[[start_line, end_line], ...]`
@@ -284,9 +298,9 @@ NORMALIZATION RULES
 INTERNAL WORKFLOW YOU MUST FOLLOW
 ====================
 Before producing the JSON:
-1. Determine the parent of `{COMMIT_HASH}` and set it as `pre_state`
+1. Determine the parent of `{commit_hash}` and set it as `pre_state`
 2. Inspect the fix commit and determine the true patch scope
-3. Identify the primary vulnerable executable unit in `{SOURCE_FILE}` or the touched file set
+3. Identify the primary vulnerable executable unit in `{source_file}` or the touched file set
 4. Extract the complete pre-fix body for the primary vulnerable executable unit from `pre_state`
 5. Extract the complete post-fix body for the primary vulnerable executable unit from `post_state`
 6. Inspect the surrounding implementation and directly relevant helpers
@@ -304,7 +318,7 @@ Before producing the JSON:
 FINAL SELF-CHECK
 ====================
 Do not output until all are true:
-1. `pre_state` is the real parent of `{COMMIT_HASH}`
+1. `pre_state` is the real parent of `{commit_hash}`
 2. `primary_function` is the true primary vulnerable executable-unit short name
 3. `primary_qualified_name` correctly disambiguates the vulnerable unit
 4. `patch.diff` matches the audited fix scope

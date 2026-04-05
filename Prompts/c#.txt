@@ -18,13 +18,13 @@ Do not invent identifiers, helper symbols, locations, definitions, vulnerable re
 ====================
 INPUT ROW
 ====================
-- cve_id: {CVE_ID}
-- commit_hash: {COMMIT_HASH}
-- selection_source: {SELECTION_SOURCE}
-- repo_name: {REPO_NAME}
-- repo_url: {REPO_URL}
-- commit_urls: {COMMIT_URLS}
-- source_file: {SOURCE_FILE}
+- cve_id: {cve_id}
+- commit_hash: {commit_hash}
+- selection_source: {selection_source}
+- repo_name: {repo_name}
+- repo_url: {repo_url}
+- commit_urls: {commit_urls}
+- source_file: {source_file}
 
 ====================
 LANGUAGE ASSUMPTION
@@ -87,6 +87,8 @@ IDENTIFIER DEFINITION RULES
 - `primary_symbol_pre` is a top-level attribute containing the full verbatim body of the primary vulnerable callable unit as it existed BEFORE the fix, including the vulnerable line(s).
 - `primary_symbol_post` is a top-level attribute containing the full verbatim body of the primary vulnerable callable unit as it existed AFTER the fix, showing the patched line(s).
 - Both `primary_symbol_pre` and `primary_symbol_post` must be complete, syntactically valid C# callable bodies extracted from the repository at `pre_state` and `post_state` respectively.
+- Every `resolved_identifiers[]` item MUST include `state` with one of `pre`, `post`, or `both`.
+- Do not collapse changed helper definitions across states into one entry; emit separate `state = "pre"` and `state = "post"` entries when the code differs.
 - If the vulnerable logic is implemented as a lambda, local function, property accessor, middleware delegate, or anonymous delegate, extract that exact code form verbatim.
 
 ====================
@@ -121,9 +123,11 @@ STRICT OUTPUT RULES
 - `primary_symbol_pre` must be a non-empty string containing the complete pre-fix callable body
 - `primary_symbol_post` must be a non-empty string containing the complete post-fix callable body
 - All `resolved_identifiers[].definition` fields must contain actual code definitions, not English descriptions
-- For each `resolved_identifiers[]` item with callable kinds, `callable_body` must be present and non-empty
+- For each `resolved_identifiers[]` item with callable kinds, `function_body` must be present and non-empty
 - `primary_vulnerable_region` must refer to the root-cause-bearing pre-fix code region only
 - `patch_relevance` must be present even if one or more of its arrays are empty
+- Every helper list must be state-specific (`*_pre` for `pre_state`, `*_post` for `post_state`) and must not merge states.
+- Every helper listed in `*_pre` or `*_post` must have at least one matching `resolved_identifiers[]` entry with consistent `state`.
 - Do not fabricate line numbers, type names, namespaces, service registrations, endpoint bindings, or diff hunks
 
 ====================
@@ -139,7 +143,15 @@ OUTPUT SCHEMA
   "file_path": "<primary vulnerable file path>",
   "primary_symbol": "<primary vulnerable callable or symbol name>",
   "primary_symbol_kind": "<method|constructor|local_function|lambda|delegate|property_accessor|event_handler|controller_action|minimal_api_handler|middleware|extension_method|static_helper|async_method|iterator_method>",
-  "helper_symbols": ["<callable_or_symbol>", "..."],
+  "helper_symbols_pre": ["<symbol_from_pre_state>", "..."],
+  "helper_symbols_post": ["<symbol_from_post_state>", "..."],
+  "helper_symbol_pairs": [
+    {
+      "pre": "<symbol_from_pre_state_or_empty>",
+      "post": "<symbol_from_post_state_or_empty>",
+      "change": "<unchanged|modified|renamed|added|removed>"
+    }
+  ],
   "namespace_context": "<namespace or namespace path>",
   "runtime_context": {
     "platform": "<aspnet|desktop|service|library|unity|blazor|unknown>",
@@ -219,7 +231,8 @@ OUTPUT SCHEMA
       "name": "<identifier>",
       "kind": "<method|constructor|lambda|delegate|property|field|class|record|struct|interface|enum|attribute|namespace|using|constant|other>",
       "definition": "<actual code definition or full callable body>",
-      "callable_body": "<full callable body when callable kind; otherwise empty string>",
+      "function_body": "<full callable body when callable kind; otherwise empty string>",
+      "state": "<pre|post|both>",
       "location": "<file:line or file range>",
       "relevance": "<why this identifier matters>"
     }
@@ -278,7 +291,8 @@ OUTPUT SCHEMA
 NORMALIZATION RULES
 ====================
 - `primary_symbol` should be the main vulnerable callable or symbol whose behavior best represents the vulnerability
-- `helper_symbols` should include only directly relevant helper callables or symbols
+- `helper_symbols_pre` and `helper_symbols_post` must include only directly relevant helper symbols from their respective states
+- `helper_symbol_pairs` should map helper identity across states and encode unchanged/modified/renamed/added/removed transitions
 - `cwe` must be a single normalized string, not an array
 - `severity` must be a single normalized string
 - `vulnerable_line_ranges` must be inclusive pre-fix ranges in the form `[[start_line, end_line], ...]`
@@ -293,9 +307,9 @@ NORMALIZATION RULES
 INTERNAL WORKFLOW YOU MUST FOLLOW
 ====================
 Before producing the JSON:
-1. Determine the parent of `{COMMIT_HASH}` and set it as `pre_state`
+1. Determine the parent of `{commit_hash}` and set it as `pre_state`
 2. Inspect the fix commit and determine the true patch scope
-3. Identify the primary vulnerable symbol in `{SOURCE_FILE}` or the touched file set
+3. Identify the primary vulnerable symbol in `{source_file}` or the touched file set
 4. Extract the complete pre-fix callable body for the primary vulnerable target from `pre_state`
 5. Extract the complete post-fix callable body for the primary vulnerable target from `post_state`
 6. Inspect the surrounding implementation and directly relevant helpers
@@ -315,7 +329,7 @@ Before producing the JSON:
 FINAL SELF-CHECK
 ====================
 Do not output until all are true:
-1. `pre_state` is the real parent of `{COMMIT_HASH}`
+1. `pre_state` is the real parent of `{commit_hash}`
 2. `primary_symbol` is the true primary vulnerable symbol
 3. `patch.diff` matches the audited fix scope
 4. `context_quality.unresolved` equals the number of items in `unresolved_identifiers`
@@ -323,7 +337,7 @@ Do not output until all are true:
 6. `primary_symbol_post` is present, non-empty, and contains a complete callable body with opening and closing braces, or an exact valid lambda/delegate/property-accessor form
 7. `vulnerable_line_ranges` is present and uses inclusive `[[start,end], ...]` pairs
 8. Every `resolved_identifier` with callable kinds has a `definition` field containing a complete callable body, not just a signature
-9. Every `resolved_identifier` with callable kinds has `callable_body` present and non-empty
+9. Every `resolved_identifier` with callable kinds has `function_body` present and non-empty
 10. No `definition` field in `resolved_identifiers` contains plain English instead of code
 11. All code definitions are syntactically plausible C# source code
 12. `primary_vulnerable_region` is present and refers only to the true root-cause-bearing pre-fix region

@@ -19,13 +19,13 @@ Do not invent identifiers, helper methods, classes, interfaces, locations, defin
 ====================
 INPUT ROW
 ====================
-- cve_id: {CVE_ID}
-- commit_hash: {COMMIT_HASH}
-- selection_source: {SELECTION_SOURCE}
-- repo_name: {REPO_NAME}
-- repo_url: {REPO_URL}
-- commit_urls: {COMMIT_URLS}
-- source_file: {SOURCE_FILE}
+- cve_id: {cve_id}
+- commit_hash: {commit_hash}
+- selection_source: {selection_source}
+- repo_name: {repo_name}
+- repo_url: {repo_url}
+- commit_urls: {commit_urls}
+- source_file: {source_file}
 
 ====================
 JAVA-SPECIFIC REPOSITORY ANALYSIS REQUIREMENTS
@@ -63,6 +63,8 @@ IDENTIFIER DEFINITION RULES
 - `primary_vulnerable_snippet_pre` is a top-level attribute containing the tight vulnerable region from the pre-fix state.
 - `primary_vulnerable_snippet_post` is a top-level attribute containing the corresponding tight patched region from the post-fix state.
 - All four body/snippet fields must be valid Java source fragments extracted from the repository.
+- Every `resolved_identifiers[]` item MUST include `state` with one of `pre`, `post`, or `both`.
+- Do not collapse changed helper definitions across states into one entry; emit separate `state = "pre"` and `state = "post"` entries when the code differs.
 - If the primary vulnerable unit is a constructor, preserve the exact constructor signature.
 - If the primary vulnerable unit is an overridden method, preserve the exact method signature and annotations.
 - If multiple overloads share the same method name, use the exact resolved signature in `primary_signature` and in all relevant identifier entries.
@@ -101,8 +103,11 @@ STRICT OUTPUT RULES
 - `primary_vulnerable_snippet_pre` must be a non-empty string containing the tight pre-fix vulnerable snippet
 - `primary_vulnerable_snippet_post` must be a non-empty string containing the tight post-fix patched snippet
 - All `resolved_identifiers[].definition` fields must contain actual code definitions, not English descriptions
+- For each `resolved_identifiers[]` item with kind = "method" or "constructor", `function_body` must be present and non-empty
 - `primary_vulnerable_region` must refer to the root-cause-bearing pre-fix code region only
 - `patch_relevance` must be present even if one or more of its arrays are empty
+- Every helper list must be state-specific (`*_pre` for `pre_state`, `*_post` for `post_state`) and must not merge states.
+- Every helper listed in `*_pre` or `*_post` must have at least one matching `resolved_identifiers[]` entry with consistent `state`.
 
 ====================
 OUTPUT SCHEMA
@@ -119,7 +124,15 @@ OUTPUT SCHEMA
   "primary_symbol_kind": "<method|constructor>",
   "primary_signature": "<fully resolved method or constructor signature>",
   "declaring_type": "<declaring class/interface/enum/record name>",
-  "helper_functions": ["<method_or_constructor>", "..."],
+  "helper_functions_pre": ["<helper_from_pre_state>", "..."],
+  "helper_functions_post": ["<helper_from_post_state>", "..."],
+  "helper_function_pairs": [
+    {
+      "pre": "<helper_from_pre_state_or_empty>",
+      "post": "<helper_from_post_state_or_empty>",
+      "change": "<unchanged|modified|renamed|added|removed>"
+    }
+  ],
   "related_symbols": [
     {
       "name": "<symbol>",
@@ -199,6 +212,8 @@ OUTPUT SCHEMA
       "name": "<identifier>",
       "kind": "<class|interface|enum|record|annotation|field|method|constructor|imported_symbol|other>",
       "definition": "<actual Java code definition or full method/constructor body>",
+      "function_body": "<full method/constructor body when kind=method|constructor; otherwise empty string>",
+      "state": "<pre|post|both>",
       "location": "<file:line or file range>",
       "relevance": "<why this identifier matters>"
     }
@@ -284,7 +299,8 @@ OUTPUT SCHEMA
 NORMALIZATION RULES
 ====================
 - `primary_function` should be the main method or constructor whose behavior best represents the vulnerability
-- `helper_functions` should include only directly relevant helper methods or constructors
+- `helper_functions_pre` and `helper_functions_post` must include only directly relevant helpers from their respective states
+- `helper_function_pairs` should map helper identity across states and encode unchanged/modified/renamed/added/removed transitions
 - `related_symbols` should contain only symbols materially relevant to exploitability or the fix
 - `cwe` must be a single normalized string, not an array
 - `severity` must be a single normalized string
@@ -312,9 +328,9 @@ JAVA-SPECIFIC ANALYSIS NOTES
 INTERNAL WORKFLOW YOU MUST FOLLOW
 ====================
 Before producing the JSON:
-1. Determine the parent of `{COMMIT_HASH}` and set it as `pre_state`
+1. Determine the parent of `{commit_hash}` and set it as `pre_state`
 2. Inspect the fix commit and determine the true patch scope
-3. Identify the primary vulnerable method or constructor in `{SOURCE_FILE}` or the touched file set
+3. Identify the primary vulnerable method or constructor in `{source_file}` or the touched file set
 4. Extract the complete pre-fix method/constructor body for the primary vulnerable unit from `pre_state`
 5. Extract the complete post-fix method/constructor body for the primary vulnerable unit from `post_state`
 6. Extract tight pre-fix and post-fix vulnerable snippets
@@ -336,7 +352,7 @@ Before producing the JSON:
 FINAL SELF-CHECK
 ====================
 Do not output until all are true:
-1. `pre_state` is the real parent of `{COMMIT_HASH}`
+1. `pre_state` is the real parent of `{commit_hash}`
 2. `primary_function` is the true primary vulnerable method or constructor
 3. `patch.diff` matches the audited fix scope
 4. `context_quality.unresolved` equals the number of items in `unresolved_identifiers`
@@ -344,12 +360,13 @@ Do not output until all are true:
 6. `vulnerable_function_post` is present, non-empty, and contains a complete method or constructor body with opening and closing braces
 7. `primary_vulnerable_snippet_pre` and `primary_vulnerable_snippet_post` are present and non-empty
 8. Every `resolved_identifier` with kind = "method" or "constructor" has a `definition` field containing a complete method or constructor body, not just a signature
-9. No `definition` field in `resolved_identifiers` contains plain English instead of code
-10. All code definitions are syntactically plausible Java source code
-11. `primary_vulnerable_region` is present and refers only to the true root-cause-bearing pre-fix region
-12. `patch_relevance.security_fix_hunks`, `patch_relevance.supporting_hunks`, and `patch_relevance.unrelated_hunks` are all present
-13. No changed hunk that is clearly unrelated is mislabeled as a security fix hunk
-14. `language_details` is present and internally consistent
+9. Every `resolved_identifier` with kind = "method" or "constructor" has `function_body` present and non-empty
+10. No `definition` field in `resolved_identifiers` contains plain English instead of code
+11. All code definitions are syntactically plausible Java source code
+12. `primary_vulnerable_region` is present and refers only to the true root-cause-bearing pre-fix region
+13. `patch_relevance.security_fix_hunks`, `patch_relevance.supporting_hunks`, and `patch_relevance.unrelated_hunks` are all present
+14. No changed hunk that is clearly unrelated is mislabeled as a security fix hunk
+15. `language_details` is present and internally consistent
 15. `related_symbols`, `entrypoints`, `sinks`, `dynamic_dispatch`, `taint_sources`, `taint_sinks`, `tests_touched`, and `render_hints` are all present (they may be empty arrays/objects where appropriate)
 16. The final JSON is valid and complete
 
