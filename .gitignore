@@ -1,2 +1,17 @@
-multiphase_flash_pipeline
-__pychache__
+# Python cache / editor noise
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Legacy local-only path
+multiphase_flash_pipeline/
+
+# Generated opencode wrapper runtime state and experiment outputs.
+# Keep the wrapper code itself tracked; ignore only run artifacts.
+opencode-cli-wrapper/__pycache__/
+opencode-cli-wrapper/output/
+opencode-cli-wrapper/prompts/
+opencode-cli-wrapper/ocw_run_loadcheck/
+opencode-cli-wrapper/multi_run_*/
+opencode-cli-wrapper/multi_test_*/
+opencode-cli-wrapper/ocw_test_*/

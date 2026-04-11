@@ -103,6 +103,57 @@ Each output JSONL record includes:
 - `stderr`
 - timestamps and duration
 
+## Multi-Provider Parallel Runner
+
+Use `multi_provider_runner.py` to run multiple provider/model/key pools in
+parallel for higher throughput.
+
+Features:
+- weighted sharding by worker count across pools
+- per-pool parallel workers (`ocw batch --workers N`)
+- retries for transient failures (timeouts/429/5xx patterns)
+- quota-aware pool disable + requeue to sibling pools of same provider
+- in-session missing-file repair (`--session ... --continue`)
+- optional normalization of `context_quality.method` to `glm` / `minimax`
+
+Example:
+
+```bash
+export GLM_API_KEY_MAIN="..."
+export GLM_API_KEY_LOW="..."
+export MINIMAX_API_KEY_A="..."
+export MINIMAX_API_KEY_B="..."
+
+python3 ./multi_provider_runner.py \
+  --ocw ./ocw \
+  --prompts-jsonl /path/to/prompts.jsonl \
+  --pool-config ./pool_config.example.json \
+  --run-root /path/to/multi_run_001 \
+  --canonical-dir /home/user1/dataset_pipeline/cves \
+  --quota-cooldown-seconds 18000 \
+  --idle-wait-seconds 1800 \
+  --max-attempts 3 \
+  --prompt-timeout-seconds 1800
+```
+
+Manual pool kill options:
+- `--disabled-pools minimax-m27,minimax-highspeed`
+  - Permanently disables those pools at startup (no cooldown probing).
+- `--manual-kill-file /path/to/disabled_pools.txt`
+  - Runner checks this file every scheduling cycle.
+  - Add pool names to disable them permanently while the run is active.
+  - File format: JSON array (`["minimax-m27"]`) or plain text (`minimax-m27` per line / comma-separated).
+
+Pool config format is JSON (`pool_config.example.json`):
+- `name`: unique pool name
+- `provider`: provider id bucket, e.g. `zai-coding-plan` / `minimax-coding-plan` (aliases like `glm` / `minimax` are also accepted)
+- `model`: full model id passed to `--model` (for example `zai-coding-plan/glm-5.1` or `minimax-coding-plan/MiniMax-M2.7`)
+- `workers`: worker count for that pool
+- `api_key_env`: environment variable name containing API key (must be a variable name, not the raw key value)
+- `extra_run_flags`: optional extra `opencode run` flags
+
+When a pool hits quota, that pool is temporarily disabled and its pending tasks are requeued to another active pool with the same normalized provider bucket. If no sibling is available, tasks wait and the runner probes that pool again every `--idle-wait-seconds` (default 1800 = 30 minutes) for automatic resume. Pools manually disabled via `--disabled-pools` or `--manual-kill-file` are never probed again.
+
 ## Deterministic Trajectory Extraction
 
 Convert raw `opencode run --format json` events into deterministic tool-call
@@ -181,6 +232,11 @@ Use the interactive driver to:
   --csv "/Users/kushalkhemka/Desktop/untitled folder 3/check_exhaustive_out.csv" \
   --prompt-dir "/Users/kushalkhemka/Desktop/untitled folder 3/opencode-cli-wrapper/language-prompts"
 ```
+
+By default, `ocw_driver.py` skips CVEs already present under
+`/home/user1/dataset_pipeline/filtered_results`. Override with
+`--skip-cves-dir <path>` or disable by passing an empty value:
+`--skip-cves-dir ""`.
 
 Template files should be named by language stem, for example:
 - `language-prompts/python.txt`

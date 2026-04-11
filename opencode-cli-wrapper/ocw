@@ -397,6 +397,13 @@ def run_prompt_once(
     started_at = now_iso()
     env = build_env(all_permissions=all_permissions, xdg_data_home=xdg_data_home)
 
+    def timeout_stream_to_text(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
     def run_with_timeout(run_command_items: Sequence[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             run_command_items,
@@ -447,16 +454,16 @@ def run_prompt_once(
                 completed = subprocess.CompletedProcess(
                     args=fallback_command,
                     returncode=124,
-                    stdout=exc.stdout or "",
-                    stderr=(exc.stderr or "")
+                    stdout=timeout_stream_to_text(exc.stdout),
+                    stderr=timeout_stream_to_text(exc.stderr)
                     + f"\n[ocw] fallback model timed out after {timeout_seconds}s",
                 )
         else:
             completed = subprocess.CompletedProcess(
                 args=command,
                 returncode=124,
-                stdout=exc.stdout or "",
-                stderr=(exc.stderr or "") + stderr_prefix.rstrip("\n"),
+                stdout=timeout_stream_to_text(exc.stdout),
+                stderr=timeout_stream_to_text(exc.stderr) + stderr_prefix.rstrip("\n"),
             )
 
     if completed is None:
@@ -731,8 +738,8 @@ def command_batch(argv: Sequence[str]) -> int:
     parser.add_argument(
         "--prompt-timeout-seconds",
         type=float,
-        default=0.0,
-        help="Per-prompt timeout in seconds (0 disables timeout)",
+        default=2400.0,
+        help="Per-prompt timeout in seconds (default: 2400; set 0 to disable timeout)",
     )
     parser.add_argument(
         "--fallback-model",

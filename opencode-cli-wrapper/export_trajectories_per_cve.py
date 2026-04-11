@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Export tool trajectories as one JSONL file per CVE.
-
-This utility uses ocw's deterministic trajectory extractor and then splits
-records by CVE parsed from each trajectory record's prompt text.
-"""
+"""Export tool trajectories as one JSONL file per (CVE, commit_hash)."""
 
 from __future__ import annotations
 
@@ -11,16 +7,21 @@ import argparse
 import json
 import re
 import subprocess
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 
 CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
+COMMIT_HASH_RE = re.compile(r"\b[0-9a-f]{7,64}\b", re.IGNORECASE)
+COMMIT_HASH_FIELD_RE = re.compile(r"(?im)^\s*-\s*commit_hash\s*:\s*([0-9a-f]{7,64})\s*$")
+COMMIT_URL_RE = re.compile(r"/commit/([0-9a-f]{7,64})", re.IGNORECASE)
+DEFAULT_CANONICAL_JSON_DIR = Path("/home/user1/dataset_pipeline/cves")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build per-CVE trajectory JSONL files from ocw batch outputs.")
+    p = argparse.ArgumentParser(description="Build per-(CVE, commit) trajectory JSONL files from ocw batch outputs.")
     p.add_argument(
         "--ocw",
         default="/Users/kushalkhemka/Desktop/untitled folder 3/opencode-cli-wrapper/ocw",
@@ -35,16 +36,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out-dir",
         required=True,
-        help="Output directory for combined intermediates and by_cve files",
+        help="Output directory for intermediates, manifests, and trajectory JSONL files",
     )
     p.add_argument(
         "--keep-merged",
         action="store_true",
-        help="Keep merged trajectory JSONL in output directory (default keeps only per-CVE + manifest + intermediates).",
+        help="Keep merged trajectory JSONL in output directory",
     )
     p.add_argument(
         "--workspace-dir",
         help="Optional workspace directory containing per-prompt JSON outputs; defaults to <out-dir>/../workspace when present.",
+    )
+    p.add_argument(
+        "--canonical-json-dir",
+        default=str(DEFAULT_CANONICAL_JSON_DIR),
+        help="Directory containing canonical JSON files (used as fallback when stdout lacks final JSON).",
     )
     return p.parse_args()
 
@@ -79,6 +85,21 @@ def write_raw_events_from_results(records: list[dict], out_path: Path) -> None:
                     handle.write(event + "\n")
 
 
+def load_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if not path.is_file():
+        return records
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                records.append(payload)
+    return records
+
+
 def run_ocw_trajectory(ocw_path: Path, raw_events: Path, output_path: Path) -> None:
     cmd = [
         str(ocw_path),
@@ -90,6 +111,44 @@ def run_ocw_trajectory(ocw_path: Path, raw_events: Path, output_path: Path) -> N
         "--raw-ids",
     ]
     subprocess.run(cmd, check=True)
+
+
+def normalize_commit_hash(value: str) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    if COMMIT_HASH_RE.fullmatch(text):
+        return text
+    match = COMMIT_URL_RE.search(text)
+    if match:
+        return match.group(1).lower()
+    return ""
+
+
+def extract_commit_hash(text: str) -> str | None:
+    if not text:
+        return None
+    match = COMMIT_HASH_FIELD_RE.search(text)
+    if match:
+        return match.group(1).lower()
+    match = COMMIT_URL_RE.search(text)
+    if match:
+        return match.group(1).lower()
+    if "commit_hash" in text.lower() or "/commit/" in text.lower():
+        match = COMMIT_HASH_RE.search(text)
+        if match:
+            return match.group(0).lower()
+    return None
+
+
+def record_key(cve: str, commit_hash: str | None) -> tuple[str, str]:
+    commit = normalize_commit_hash(commit_hash or "") or "unknowncommit"
+    return (cve.upper(), commit)
+
+
+def trajectory_output_path(out_dir: Path, cve: str, commit_hash: str | None) -> Path:
+    cve_text, commit_text = record_key(cve, commit_hash)
+    return out_dir / f"{cve_text.lower()}_{commit_text}_trajectory.jsonl"
 
 
 def cve_from_prompt(prompt: str) -> str | None:
@@ -157,19 +216,110 @@ def extract_session_ids_from_stdout(stdout: str) -> set[str]:
     return session_ids
 
 
-def build_session_to_cve(records: list[dict]) -> dict[str, str]:
-    session_to_cve: dict[str, str] = {}
+def build_session_to_key(records: list[dict]) -> dict[str, tuple[str, str]]:
+    session_to_key: dict[str, tuple[str, str]] = {}
     for record in records:
         prompt = record.get("prompt", "")
         cve = cve_from_prompt(prompt if isinstance(prompt, str) else "")
         if not cve:
             continue
+        commit_hash = extract_commit_hash(prompt if isinstance(prompt, str) else "")
         stdout = record.get("stdout", "")
         if not isinstance(stdout, str) or not stdout:
             continue
         for session_id in extract_session_ids_from_stdout(stdout):
-            session_to_cve[session_id] = cve
-    return session_to_cve
+            session_to_key[session_id] = record_key(cve, commit_hash)
+    return session_to_key
+
+
+def merge_trajectory_records(existing: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in [*existing, *incoming]:
+        key = json.dumps(record, ensure_ascii=True, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(record)
+    return merged
+
+
+def merge_trajectory_file(target_path: Path, incoming: list[dict[str, Any]]) -> int:
+    existing: list[dict[str, Any]] = []
+    if target_path.is_file():
+        try:
+            existing = load_jsonl_records(target_path)
+        except json.JSONDecodeError:
+            existing = []
+    merged = merge_trajectory_records(existing, incoming)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with target_path.open("w", encoding="utf-8") as handle:
+        for record in merged:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+    return len(merged)
+
+
+def split_records_by_key(
+    trajectory_records: list[dict[str, Any]],
+    session_to_key: dict[str, tuple[str, str]],
+) -> tuple[dict[tuple[str, str], list[dict[str, Any]]], list[dict[str, Any]]]:
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    unknown: list[dict[str, Any]] = []
+    for record in trajectory_records:
+        session_id = record.get("session_id", "")
+        key = session_to_key.get(session_id) if isinstance(session_id, str) else None
+        if key is None:
+            unknown.append(record)
+            continue
+        buckets[key].append(record)
+    return buckets, unknown
+
+
+def export_records_to_flat_cve_files(
+    *,
+    records: list[dict[str, Any]],
+    ocw_path: Path,
+    out_dir: Path,
+) -> dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not records:
+        return {
+            "attempted": False,
+            "reason": "no_records",
+            "keys_written": 0,
+            "trajectory_records": 0,
+        }
+
+    with tempfile.TemporaryDirectory(prefix="traj_export_", dir=str(out_dir)) as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        raw_events = tmp_path / "raw_events.jsonl"
+        merged_trajectories = tmp_path / "tool_trajectories.jsonl"
+        write_raw_events_from_results(records, raw_events)
+        if raw_events.stat().st_size == 0:
+            return {
+                "attempted": False,
+                "reason": "no_raw_events",
+                "keys_written": 0,
+                "trajectory_records": 0,
+            }
+        run_ocw_trajectory(ocw_path, raw_events, merged_trajectories)
+        trajectory_records = load_jsonl_records(merged_trajectories)
+
+    session_to_key = build_session_to_key(records)
+    buckets, unknown = split_records_by_key(trajectory_records, session_to_key)
+    counts: dict[str, int] = {}
+    for (cve, commit_hash), key_records in sorted(buckets.items()):
+        out_path = trajectory_output_path(out_dir, cve, commit_hash)
+        counts[out_path.name] = merge_trajectory_file(out_path, key_records)
+
+    return {
+        "attempted": True,
+        "reason": "ok",
+        "keys_written": len(counts),
+        "trajectory_records": len(trajectory_records),
+        "unknown_records": len(unknown),
+        "counts": counts,
+    }
 
 
 def recover_workspace_payloads(workspace_dir: Path) -> tuple[dict[str, dict[str, Any]], dict[str, int], dict[str, str]]:
@@ -235,7 +385,47 @@ def recover_workspace_payloads(workspace_dir: Path) -> tuple[dict[str, dict[str,
     return payloads, stats, source_files
 
 
-def write_canonical_records(records: list[dict], out_dir: Path, workspace_dir: Path | None = None) -> dict[str, Any]:
+def recover_canonical_dir_payloads(
+    canonical_json_dir: Path,
+    prompt_cves: set[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, int], dict[str, str]]:
+    stats = {
+        "files_expected": len(prompt_cves),
+        "files_found": 0,
+        "missing_files": 0,
+        "parse_errors": 0,
+        "non_object_payload": 0,
+        "selected": 0,
+    }
+    payloads: dict[str, dict[str, Any]] = {}
+    source_files: dict[str, str] = {}
+    for cve in sorted(prompt_cves):
+        candidates = [canonical_json_dir / f"{cve}.json", *sorted(canonical_json_dir.glob(f"{cve}__*.json"))]
+        path = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if path is None:
+            stats["missing_files"] += 1
+            continue
+        stats["files_found"] += 1
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            stats["parse_errors"] += 1
+            continue
+        if not isinstance(payload, dict):
+            stats["non_object_payload"] += 1
+            continue
+        payloads[cve] = payload
+        source_files[cve] = path.name
+    stats["selected"] = len(payloads)
+    return payloads, stats, source_files
+
+
+def write_canonical_records(
+    records: list[dict],
+    out_dir: Path,
+    workspace_dir: Path | None = None,
+    canonical_json_dir: Path | None = None,
+) -> dict[str, Any]:
     canonical_dir = out_dir / "canonical_records"
     canonical_dir.mkdir(parents=True, exist_ok=True)
 
@@ -290,6 +480,36 @@ def write_canonical_records(records: list[dict], out_dir: Path, workspace_dir: P
     if workspace_dir is not None and workspace_dir.is_dir():
         workspace_payloads, workspace_stats, workspace_source_files = recover_workspace_payloads(workspace_dir)
 
+    canonical_payloads: dict[str, dict[str, Any]] = {}
+    canonical_source_files: dict[str, str] = {}
+    canonical_stats: dict[str, int] = {
+        "files_expected": 0,
+        "files_found": 0,
+        "missing_files": 0,
+        "parse_errors": 0,
+        "non_object_payload": 0,
+        "selected": 0,
+    }
+    if canonical_json_dir is not None and canonical_json_dir.is_dir():
+        canonical_payloads, canonical_stats, canonical_source_files = recover_canonical_dir_payloads(
+            canonical_json_dir,
+            prompt_cves,
+        )
+
+    canonical_recovered = 0
+    canonical_missing_for_prompt_cves = 0
+    for cve in sorted(prompt_cves):
+        if cve in chosen:
+            continue
+        payload = canonical_payloads.get(cve)
+        if payload is None:
+            canonical_missing_for_prompt_cves += 1
+            continue
+        chosen[cve] = payload
+        source_file = canonical_source_files.get(cve, "")
+        chosen_source[cve] = f"canonical_json_dir:{source_file}" if source_file else "canonical_json_dir"
+        canonical_recovered += 1
+
     workspace_recovered = 0
     workspace_missing_for_prompt_cves = 0
     for cve in sorted(prompt_cves):
@@ -312,6 +532,9 @@ def write_canonical_records(records: list[dict], out_dir: Path, workspace_dir: P
         "written": len(chosen),
         "sources": {
             "stdout": len([cve for cve, source in chosen_source.items() if source == "stdout"]),
+            "canonical_json_dir": len(
+                [cve for cve, source in chosen_source.items() if source.startswith("canonical_json_dir")]
+            ),
             "workspace": len([cve for cve, source in chosen_source.items() if source.startswith("workspace")]),
         },
         "stdout": {
@@ -327,43 +550,27 @@ def write_canonical_records(records: list[dict], out_dir: Path, workspace_dir: P
             "missing_for_prompt_cves": workspace_missing_for_prompt_cves,
             "scan": workspace_stats,
         },
+        "canonical_json_dir": {
+            "dir": str(canonical_json_dir) if canonical_json_dir is not None else None,
+            "recovered_for_prompt_cves": canonical_recovered,
+            "missing_for_prompt_cves": canonical_missing_for_prompt_cves,
+            "scan": canonical_stats,
+        },
     }
 
 
-def split_by_cve(trajectory_path: Path, out_dir: Path, session_to_cve: dict[str, str]) -> dict[str, int]:
-    by_cve_dir = out_dir / "by_cve"
-    by_cve_dir.mkdir(parents=True, exist_ok=True)
-
-    buckets: dict[str, list[str]] = defaultdict(list)
-    unknown: list[str] = []
-
-    with trajectory_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            raw = line.strip()
-            if not raw:
-                continue
-            record = json.loads(raw)
-            session_id = record.get("session_id", "")
-            cve = session_to_cve.get(session_id) if isinstance(session_id, str) else None
-            if cve is None:
-                unknown.append(raw)
-                continue
-            buckets[cve].append(raw)
+def split_by_key(trajectory_path: Path, out_dir: Path, session_to_key: dict[str, tuple[str, str]]) -> dict[str, int]:
+    buckets, unknown = split_records_by_key(load_jsonl_records(trajectory_path), session_to_key)
 
     counts: dict[str, int] = {}
-    for cve, rows in sorted(buckets.items()):
-        out_file = by_cve_dir / f"{cve}.jsonl"
-        with out_file.open("w", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(row + "\n")
-        counts[cve] = len(rows)
+    for (cve, commit_hash), records in sorted(buckets.items()):
+        out_file = trajectory_output_path(out_dir, cve, commit_hash)
+        counts[out_file.name] = merge_trajectory_file(out_file, records)
 
     if unknown:
-        unknown_file = by_cve_dir / "UNKNOWN.jsonl"
-        with unknown_file.open("w", encoding="utf-8") as handle:
-            for row in unknown:
-                handle.write(row + "\n")
-        counts["UNKNOWN"] = len(unknown)
+        unknown_file = out_dir / "unknown_trajectory.jsonl"
+        merge_trajectory_file(unknown_file, unknown)
+        counts[unknown_file.name] = len(unknown)
 
     return counts
 
@@ -381,29 +588,37 @@ def main() -> int:
         inferred_workspace = out_dir.parent / "workspace"
         if inferred_workspace.is_dir():
             workspace_dir = inferred_workspace
+    canonical_json_dir: Path | None = None
+    if args.canonical_json_dir:
+        canonical_json_dir = Path(args.canonical_json_dir).expanduser()
 
     records = load_result_records(results)
 
     combined_results = out_dir / "combined_batch_results.jsonl"
     raw_events = out_dir / "raw_events_merged.jsonl"
     merged_trajectories = out_dir / "tool_trajectories_merged.jsonl"
-    manifest_path = out_dir / "by_cve_manifest.json"
+    manifest_path = out_dir / "trajectory_manifest.json"
 
     write_combined_results(records, combined_results)
     write_raw_events_from_results(records, raw_events)
     run_ocw_trajectory(ocw, raw_events, merged_trajectories)
 
-    session_to_cve = build_session_to_cve(records)
-    counts = split_by_cve(merged_trajectories, out_dir, session_to_cve)
-    canonical_stats = write_canonical_records(records, out_dir, workspace_dir=workspace_dir)
+    session_to_key = build_session_to_key(records)
+    counts = split_by_key(merged_trajectories, out_dir, session_to_key)
+    canonical_stats = write_canonical_records(
+        records,
+        out_dir,
+        workspace_dir=workspace_dir,
+        canonical_json_dir=canonical_json_dir,
+    )
 
     manifest = {
         "input_results_files": [str(p) for p in results],
         "combined_records": len(records),
-        "total_cve_files": len([k for k in counts if k != "UNKNOWN"]),
-        "unknown_records": counts.get("UNKNOWN", 0),
-        "by_cve_counts": counts,
-        "by_cve_dir": str(out_dir / "by_cve"),
+        "total_trajectory_files": len([k for k in counts if k != "unknown_trajectory.jsonl"]),
+        "unknown_records": counts.get("unknown_trajectory.jsonl", 0),
+        "trajectory_counts": counts,
+        "trajectory_dir": str(out_dir),
         "intermediates": {
             "combined_batch_results": str(combined_results),
             "raw_events_merged": str(raw_events),

@@ -27,6 +27,25 @@ INPUT ROW
 - source_file: {source_file}
 
 ====================
+DETERMINISTIC PATH RULES
+====================
+- Use deterministic paths only; never use random, timestamped, or user-home-derived temporary directories.
+- Repository clone/checkout path MUST be exactly: `/home/user1/dataset_pipeline/repos/{cve_id}`
+- If `/home/user1/dataset_pipeline/repos/{cve_id}` already exists, reuse it instead of cloning into a different path.
+- Primary canonical JSON path MUST be exactly: `/home/user1/dataset_pipeline/cves/{cve_id}__{commit_hash}.json`
+- The filename must use the CVE ID exactly as provided (example: `CVE-2023-0215.json`).
+- Do not write alternate final JSON filenames (no `_output`, `_canonical`, numbered, or random suffixes).
+- Do not emit the full JSON object to stdout.
+
+====================
+FILE WRITE REQUIREMENTS
+====================
+- Persist the final canonical JSON to `/home/user1/dataset_pipeline/cves/{cve_id}__{commit_hash}.json` before finishing.
+- Stdout-only completion is invalid.
+- If file writing fails, retry until the write succeeds.
+- The saved file must contain the complete canonical JSON object.
+
+====================
 REPOSITORY ANALYSIS REQUIREMENTS
 ====================
 - Resolve all identifiers required for exploitability or patch understanding:
@@ -135,9 +154,9 @@ PATCH UNTANGLING RULES
 ====================
 STRICT OUTPUT RULES
 ====================
-- Output VALID JSON only
+- Persist VALID JSON in `/home/user1/dataset_pipeline/cves/{cve_id}__{commit_hash}.json`.
 - No markdown fences
-- No prose outside JSON
+- After saving the file, stdout must be exactly: `SAVED /home/user1/dataset_pipeline/cves/{cve_id}__{commit_hash}.json`.
 - No extra top-level keys
 - `unresolved_identifiers` must be an array, possibly empty
 - `patch.diff` must be the complete unified diff for the true fix scope
@@ -352,4 +371,12 @@ Do not output until all are true:
 13. No changed hunk that is clearly unrelated is mislabeled as a security fix hunk
 14. The final JSON is valid and complete
 
-Now produce the final canonical JSON object only.
+
+====================
+FILE PERSISTENCE SELF-CHECK
+====================
+Do not finish until all are true:
+- `/home/user1/dataset_pipeline/cves/{cve_id}__{commit_hash}.json` exists and is valid JSON.
+- The saved file contains the complete canonical JSON object.
+
+Now write the final canonical JSON object to `/home/user1/dataset_pipeline/cves/{cve_id}__{commit_hash}.json`. After successful save, output exactly: `SAVED /home/user1/dataset_pipeline/cves/{cve_id}__{commit_hash}.json`.

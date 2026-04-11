@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive pipeline driver for CSV -> ocw batch -> per-CVE trajectories."""
+"""Interactive pipeline driver for CSV -> ocw batch -> per-(CVE, commit) trajectories."""
 
 from __future__ import annotations
 
@@ -19,11 +19,20 @@ from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CSV = (SCRIPT_DIR.parent / "cvelistV5_exhaustive_commit_hashes_working_repos_only.csv").resolve()
+DEFAULT_CSV = (
+    SCRIPT_DIR.parent / "csv" / "cvelistV5_exhaustive_commit_hashes_working_repos_only_deduped.csv"
+).resolve()
 DEFAULT_PROMPT_DIR = (SCRIPT_DIR.parent / "Prompts").resolve()
 DEFAULT_OCW = (SCRIPT_DIR / "ocw").resolve()
 DEFAULT_EXPORTER = (SCRIPT_DIR / "export_trajectories_per_cve.py").resolve()
-DEFAULT_PROMPT_TIMEOUT_SECONDS = 1800.0
+DEFAULT_CANONICAL_JSON_DIR = (SCRIPT_DIR.parent / "cves").resolve()
+DEFAULT_TOOL_TRAJECTORY_DIR = Path("/home/user1/dataset_pipeline/tool_trajectory").resolve()
+DEFAULT_SKIP_CVES_DIRS = [
+    Path("/home/user1/dataset_pipeline/filtered_results").resolve(),
+    Path("/home/user1/dataset_pipeline/cves").resolve(),
+]
+DEFAULT_SKIP_CVES_DIRS_TEXT = ",".join(str(path) for path in DEFAULT_SKIP_CVES_DIRS)
+DEFAULT_PROMPT_TIMEOUT_SECONDS = 2400.0
 DEFAULT_FALLBACK_MODEL = ""
 
 LANGUAGE_RULES: list[tuple[str, list[str]]] = [
@@ -46,6 +55,7 @@ LANGUAGE_PATTERNS: list[tuple[str, list[re.Pattern[str]]]] = [
 ]
 CVES_IN_TEXT_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
 CVE_ID_RE = re.compile(r"^CVE-(\d{4})-(\d{4,})$", re.IGNORECASE)
+COMMIT_HASH_RE = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
 
 SOURCE_EXT_LANGUAGE: dict[str, str] = {
     ".c": "C",
@@ -218,6 +228,89 @@ def parse_csv_rows(csv_path: Path, exclude_linux: bool) -> list[dict[str, str]]:
     return rows
 
 
+def normalize_commit_hash(value: str) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    if COMMIT_HASH_RE.fullmatch(text):
+        return text
+    match = re.search(r"/commit/([0-9a-f]{7,64})", text, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    return ""
+
+
+def cve_commit_key(cve_value: str, commit_value: str) -> tuple[str, str] | None:
+    cve = cve_from_text(cve_value or "")
+    commit = normalize_commit_hash(commit_value or "")
+    if not cve or not commit:
+        return None
+    return (cve, commit)
+
+
+def row_cve_commit_key(row: dict[str, str]) -> tuple[str, str] | None:
+    return cve_commit_key(str(row.get("cve_id", "")), str(row.get("commit_hash", "")))
+
+
+def entry_cve_commit_key(entry: dict[str, Any]) -> tuple[str, str] | None:
+    return cve_commit_key(str(entry.get("cve_id", "")), str(entry.get("commit_hash", "")))
+
+
+def collect_cve_commit_keys_from_directory(path: Path) -> set[tuple[str, str]]:
+    if not path.exists() or not path.is_dir():
+        return set()
+    keys: set[tuple[str, str]] = set()
+    for file_path in path.rglob("*.json"):
+        if not file_path.is_file():
+            continue
+        try:
+            payload = json.loads(file_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        records: list[dict[str, Any]] = []
+        if isinstance(payload, dict):
+            records = [payload]
+        elif isinstance(payload, list):
+            records = [item for item in payload if isinstance(item, dict)]
+        for record in records:
+            key = cve_commit_key(
+                str(record.get("cve_id", "")) or file_path.name,
+                str(record.get("commit_hash") or record.get("commit") or ""),
+            )
+            if key is not None:
+                keys.add(key)
+    return keys
+
+
+def filter_rows_by_cve_commit_keys(
+    rows: list[dict[str, str]], excluded_keys: set[tuple[str, str]]
+) -> tuple[list[dict[str, str]], int]:
+    if not excluded_keys:
+        return rows, 0
+    kept: list[dict[str, str]] = []
+    skipped = 0
+    for row in rows:
+        key = row_cve_commit_key(row)
+        if key is not None and key in excluded_keys:
+            skipped += 1
+            continue
+        kept.append(row)
+    return kept, skipped
+
+
+def parse_skip_directories(raw: str) -> list[Path]:
+    values = [part.strip() for part in (raw or "").split(",") if part.strip()]
+    seen: set[Path] = set()
+    resolved: list[Path] = []
+    for value in values:
+        path = Path(value).expanduser().resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        resolved.append(path)
+    return resolved
+
+
 def count_cwes(rows: list[dict[str, str]]) -> Counter[str]:
     counter: Counter[str] = Counter()
     for row in rows:
@@ -380,7 +473,7 @@ def append_jsonl(src_path: Path, dst_path: Path) -> int:
     return appended
 
 
-def collect_completed_cves(results_path: Path) -> set[str]:
+def collect_completed_prompts(results_path: Path) -> set[str]:
     if not results_path.exists():
         return set()
 
@@ -401,9 +494,9 @@ def collect_completed_cves(results_path: Path) -> set[str]:
             prompt = record.get("prompt", "")
             if not isinstance(prompt, str):
                 continue
-            cve = cve_from_text(prompt)
-            if cve:
-                completed.add(cve)
+            normalized_prompt = prompt.strip()
+            if normalized_prompt:
+                completed.add(normalized_prompt)
     return completed
 
 
@@ -549,6 +642,7 @@ def export_trajectories_per_cve(
     ocw_path: Path,
     results_jsonl: Path,
     output_dir: Path,
+    canonical_json_dir: Path | None = None,
 ) -> int:
     command = [
         sys.executable,
@@ -560,7 +654,9 @@ def export_trajectories_per_cve(
         "--out-dir",
         str(output_dir),
     ]
-    print("\nExporting deterministic per-CVE tool trajectories:")
+    if canonical_json_dir is not None:
+        command.extend(["--canonical-json-dir", str(canonical_json_dir)])
+    print("\nExporting deterministic per-(CVE, commit) tool trajectories:")
     print(" ", shlex.join(command))
     return subprocess.call(command)
 
@@ -569,14 +665,19 @@ def copy_detected_canonical_records(
     workspace_dir: Path,
     cves: list[str],
     canonical_dir: Path,
+    canonical_json_dir: Path | None = None,
 ) -> dict[str, Any]:
     canonical_dir.mkdir(parents=True, exist_ok=True)
-    json_files = [path for path in workspace_dir.rglob("*.json") if path.is_file()]
+    workspace_json_files = [path for path in workspace_dir.rglob("*.json") if path.is_file()]
 
     summary: dict[str, Any] = {"copied": {}, "missing": []}
     for cve in sorted(set(cves)):
         cve_upper = cve.upper()
-        candidates = [path for path in json_files if cve_upper in path.name.upper()]
+        candidates = [path for path in workspace_json_files if cve_upper in path.name.upper()]
+        if canonical_json_dir is not None:
+            direct_candidate = canonical_json_dir / f"{cve_upper}.json"
+            if direct_candidate.is_file():
+                candidates.append(direct_candidate)
         if not candidates:
             summary["missing"].append(cve_upper)
             continue
@@ -596,7 +697,7 @@ def copy_detected_canonical_records(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Interactive menu pipeline: CSV -> ocw batch -> per-CVE deterministic trajectories."
+        description="Interactive menu pipeline: CSV -> ocw batch -> per-(CVE, commit) deterministic trajectories."
     )
     parser.add_argument("--csv", default=str(DEFAULT_CSV), help="Path to source CSV file")
     parser.add_argument(
@@ -609,6 +710,25 @@ def main() -> int:
         "--exporter",
         default=str(DEFAULT_EXPORTER),
         help="Path to export_trajectories_per_cve.py",
+    )
+    parser.add_argument(
+        "--canonical-json-dir",
+        default=str(DEFAULT_CANONICAL_JSON_DIR),
+        help="Directory where prompts save canonical JSON files as <CVE>.json",
+    )
+    parser.add_argument(
+        "--tool-trajectory-dir",
+        default=str(DEFAULT_TOOL_TRAJECTORY_DIR),
+        help="Directory where trajectory artifacts are written",
+    )
+    parser.add_argument(
+        "--skip-cves-dir",
+        default=DEFAULT_SKIP_CVES_DIRS_TEXT,
+        help=(
+            "Comma-separated directories to scan for existing JSON outputs used for resume skipping. "
+            "Rows are skipped only when both cve_id and commit_hash match an existing JSON record. "
+            "Use empty string to disable."
+        ),
     )
     parser.add_argument(
         "--include-linux",
@@ -629,7 +749,7 @@ def main() -> int:
     parser.add_argument(
         "--per-language-limit",
         type=int,
-        default=200,
+        default=300,
         help="Max rows to sample per selected language (<=0 means no cap)",
     )
     parser.add_argument(
@@ -654,9 +774,27 @@ def main() -> int:
     prompt_dir = Path(args.prompt_dir).expanduser().resolve()
     ocw_path = Path(args.ocw).expanduser().resolve()
     exporter_path = Path(args.exporter).expanduser().resolve()
+    canonical_json_dir = Path(args.canonical_json_dir).expanduser().resolve()
+    tool_trajectory_dir = Path(args.tool_trajectory_dir).expanduser().resolve()
+    skip_cves_dirs = parse_skip_directories((args.skip_cves_dir or "").strip())
 
     templates = discover_prompt_templates(prompt_dir)
     rows = parse_csv_rows(csv_path=csv_path, exclude_linux=not args.include_linux)
+    skipped_rows_by_existing = 0
+    existing_keys: set[tuple[str, str]] = set()
+    existing_key_counts_by_dir: dict[str, int] = {}
+    for skip_dir in skip_cves_dirs:
+        keys = collect_cve_commit_keys_from_directory(skip_dir)
+        existing_key_counts_by_dir[str(skip_dir)] = len(keys)
+        existing_keys.update(keys)
+    rows, skipped_rows_by_existing = filter_rows_by_cve_commit_keys(rows, existing_keys)
+    if skip_cves_dirs:
+        print("\nExisting output skip directories:")
+        for skip_dir in skip_cves_dirs:
+            print(f"  - {skip_dir}: cve+commit keys={existing_key_counts_by_dir.get(str(skip_dir), 0)}")
+        print(
+            f"  merged keys={len(existing_keys)} rows_skipped={skipped_rows_by_existing}"
+        )
     print_distribution(rows, title="Dataset summary (post-filter)")
 
     language_counts = Counter(row["_language"] for row in rows)
@@ -713,7 +851,6 @@ def main() -> int:
 
     input_dir = run_dir / "input"
     workspace_dir = run_dir / "workspace"
-    tool_trajectory_dir = run_dir / "tool_trajectory"
     canonical_records_dir = run_dir / "canonical_records"
     for directory in (input_dir, workspace_dir, tool_trajectory_dir, canonical_records_dir):
         directory.mkdir(parents=True, exist_ok=True)
@@ -740,8 +877,9 @@ def main() -> int:
     print(f"  run dir: {run_dir}")
     print(f"  workspace (opencode cwd): {workspace_dir}")
     print(f"  batch results: {batch_results_jsonl}")
-    print(f"  trajectories per cve: {tool_trajectory_dir / 'by_cve'}")
+    print(f"  trajectories per cve+commit: {tool_trajectory_dir}")
     print(f"  canonical records target: {canonical_records_dir}")
+    print(f"  canonical json source dir: {canonical_json_dir}")
     print("  trajectory generation is deterministic from raw events (not LLM-generated).")
 
     confirm = prompt_input("Start run? (yes/no)", "yes").strip().lower()
@@ -763,12 +901,32 @@ def main() -> int:
         print(f"\nGenerated prompts: {prompts_jsonl} ({len(selected_entries)} rows)")
 
     selected_cves = [str(entry.get("cve_id", "")).upper() for entry in selected_entries if entry.get("cve_id")]
-    completed_cves = collect_completed_cves(batch_results_jsonl) if args.resume else set()
+    completed_prompts = collect_completed_prompts(batch_results_jsonl) if args.resume else set()
     pending_entries = [
-        entry for entry in selected_entries if str(entry.get("cve_id", "")).upper() not in completed_cves
+        entry for entry in selected_entries if str(entry.get("prompt", "")).strip() not in completed_prompts
     ]
+    if existing_keys:
+        before_pending = len(pending_entries)
+        filtered_pending: list[dict[str, Any]] = []
+        for entry in pending_entries:
+            key = entry_cve_commit_key(entry)
+            if key is not None and key in existing_keys:
+                continue
+            filtered_pending.append(entry)
+        pending_entries = filtered_pending
+        skipped_pending = before_pending - len(pending_entries)
+        if skipped_pending > 0:
+            print(
+                f"Skipped pending entries due to existing cve+commit outputs in {len(skip_cves_dirs)} directories: {skipped_pending}"
+            )
+    selected_keys = {key for key in (entry_cve_commit_key(entry) for entry in selected_entries) if key is not None}
+    completed_keys = {
+        key
+        for key in (entry_cve_commit_key(entry) for entry in selected_entries if str(entry.get("prompt", "")).strip() in completed_prompts)
+        if key is not None
+    }
     print(
-        f"Resume status: total selected={len(selected_entries)}, completed={len(completed_cves & set(selected_cves))}, pending={len(pending_entries)}"
+        f"Resume status: total selected={len(selected_entries)}, completed={len(completed_prompts)}, pending={len(pending_entries)}"
     )
 
     appended_results = 0
@@ -807,6 +965,7 @@ def main() -> int:
             ocw_path=ocw_path,
             results_jsonl=batch_results_jsonl,
             output_dir=tool_trajectory_dir,
+            canonical_json_dir=canonical_json_dir,
         )
     else:
         print("No batch results file found; skipping trajectory export.")
@@ -816,6 +975,7 @@ def main() -> int:
         workspace_dir=workspace_dir,
         cves=selected_cves,
         canonical_dir=canonical_records_dir,
+        canonical_json_dir=canonical_json_dir,
     )
     canonical_manifest_path = run_dir / "canonical_records_manifest.json"
     canonical_manifest_path.write_text(
@@ -845,13 +1005,19 @@ def main() -> int:
             "prompt_timeout_seconds": args.prompt_timeout_seconds,
             "fallback_model": args.fallback_model,
             "resume": args.resume,
+            "skip_cves_dir": ",".join(str(path) for path in skip_cves_dirs),
         },
         "resume": {
             "using_existing_inputs": using_existing_inputs,
             "selected_entries": len(selected_entries),
-            "completed_cves": len(completed_cves),
+            "completed_entries": len(completed_prompts),
             "pending_entries": len(pending_entries),
             "new_results_appended": appended_results,
+            "rows_skipped_by_existing_cves": skipped_rows_by_existing,
+            "existing_cve_commit_keys_found": len(existing_keys),
+            "selected_cve_commit_keys": len(selected_keys),
+            "completed_cve_commit_keys": len(completed_keys),
+            "existing_key_counts_by_dir": existing_key_counts_by_dir,
         },
         "deterministic_trajectory": True,
     }

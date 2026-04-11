@@ -1,0 +1,52 @@
+{
+  "pools": [
+    {
+      "name": "glm-main",
+      "provider": "zai-coding-plan",
+      "model": "zai-coding-plan/glm-5.1",
+      "workers": 12,
+      "api_key_env": "GLM_API_KEY_MAIN",
+      "extra_run_flags": []
+    },
+    {
+      "name": "glm-low",
+      "provider": "zai-coding-plan",
+      "model": "zai-coding-plan/glm-5.1",
+      "workers": 3,
+      "api_key_env": "GLM_API_KEY_LOW",
+      "extra_run_flags": []
+    },
+    {
+      "name": "minimax-m27",
+      "provider": "minimax-coding-plan",
+      "model": "minimax-coding-plan/MiniMax-M2.7",
+      "workers": 20,
+      "api_key_env": "MINIMAX_API_KEY_A",
+      "extra_run_flags": []
+    },
+    {
+      "name": "minimax-highspeed",
+      "provider": "minimax-coding-plan",
+      "model": "minimax-coding-plan/MiniMax-M2.7-highspeed",
+      "workers": 12,
+      "api_key_env": "MINIMAX_API_KEY_B",
+      "extra_run_flags": []
+    },
+    {
+      "name": "minimax-m27-c",
+      "provider": "minimax-coding-plan",
+      "model": "minimax-coding-plan/MiniMax-M2.7",
+      "workers": 20,
+      "api_key_env": "MINIMAX_API_KEY_C",
+      "extra_run_flags": []
+    },
+    {
+      "name": "minimax-m27-d",
+      "provider": "minimax-coding-plan",
+      "model": "minimax-coding-plan/MiniMax-M2.7",
+      "workers": 20,
+      "api_key_env": "MINIMAX_API_KEY_D",
+      "extra_run_flags": []
+    }
+  ]
+}
